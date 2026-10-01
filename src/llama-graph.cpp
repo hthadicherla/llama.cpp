@@ -3832,6 +3832,35 @@ void llm_graph_context::build_sampling() const {
     res->t_sampled_logits.resize(n_rows, nullptr);
     res->t_candidates.resize(n_rows, nullptr);
 
+    bool batch_greedy = n_rows > 0;
+    for (const auto & [seq_id, rows] : sampling_rows) {
+        const auto it = samplers.find(seq_id);
+        if (it == samplers.end() || std::strcmp(llama_sampler_name(it->second), "chain") != 0 ||
+            llama_sampler_chain_n(it->second) != 1 ||
+            std::strcmp(llama_sampler_name(llama_sampler_chain_get(it->second, 0)), "+greedy") != 0) {
+            batch_greedy = false;
+            break;
+        }
+    }
+    if (batch_greedy) {
+        ggml_tensor * sampled = ggml_argmax(ctx0, res->t_logits);
+        ggml_set_name(sampled, "batch_greedy_argmax");
+        const int64_t logits_rows = ggml_nrows(res->t_logits);
+        GGML_ASSERT(n_rows <= logits_rows);
+        ggml_tensor * selected_logits = ggml_get_rows(ctx0,
+                ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], logits_rows),
+                ggml_reshape_2d(ctx0, sampled, 1, logits_rows));
+        selected_logits = ggml_reshape_1d(ctx0, selected_logits, logits_rows);
+        for (uint32_t row = 0; row < n_rows; ++row) {
+            res->t_sampled[row] = ggml_view_1d(ctx0, sampled, 1, row * sizeof(int32_t));
+            res->t_candidates[row] = res->t_sampled[row];
+            res->t_sampled_logits[row] = ggml_view_1d(ctx0, selected_logits, 1, row * sizeof(float));
+            ggml_build_forward_expand(gf, res->t_sampled[row]);
+            ggml_build_forward_expand(gf, res->t_sampled_logits[row]);
+        }
+        return;
+    }
+
     // res->t_logits will contain logits for all tokens that want the logits calculated (logits=1 or output=1)
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
 

@@ -87,7 +87,8 @@ struct test_context {
             int32_t n_seq_max = -1,
             uint32_t n_outputs_max = 0,
             uint32_t n_ubatch = 0,
-            uint32_t n_outputs_max_per_seq = 1) {
+            uint32_t n_outputs_max_per_seq = 1,
+            bool kv_unified = true) {
         auto * model = params.model.get();
 
         GGML_ASSERT(model);
@@ -103,7 +104,7 @@ struct test_context {
         cparams.n_outputs_max_per_seq = n_outputs_max_per_seq;
         cparams.samplers = configs.data();
         cparams.n_samplers = configs.size();
-        cparams.kv_unified = true;
+        cparams.kv_unified = kv_unified;
 
         // If n_seq_max is not specified, calculate it from configs
         if (n_seq_max < 0) {
@@ -347,6 +348,78 @@ static void test_backend_greedy_sampling(const test_params & params) {
         printf("Generation step %d: token id:%d, string: %s\n", i, token, test_ctx.token_to_piece(token, false).c_str());
         if (!test_ctx.decode_token(token, 0)) {
             GGML_ASSERT(false && "Failed to decode token");
+        }
+    }
+}
+
+
+static void test_backend_reordered_outputs(const test_params & params) {
+    for (bool unified : {false, true}) {
+        for (uint32_t ubatch : {8, 64}) {
+            std::vector<llama_sampler_seq_config> configs;
+            test_context test_ctx(params, configs, 4, 64, ubatch, 16, unified);
+            auto * ctx = test_ctx.ctx.get();
+            const auto tokens = common_tokenize(ctx, "Write a Python function to sort a list of numbers.", true, true);
+            common_batch batch(ctx);
+            // Test mixed CPU/backend outputs with an unsplit batch.
+            for (int mixed = 0; mixed < (ubatch == 64 ? 2 : 1); ++mixed) {
+                std::vector<llama_token> expected;
+                std::vector<float> expected_logits;
+                for (int backend = 0; backend < 2; ++backend) {
+                    llama_memory_clear(llama_get_memory(ctx), true);
+                    std::vector<llama_sampler_ptr> chains;
+                    for (int s = 0; backend && s < 4; ++s) {
+                        if (mixed && s % 2) {
+                            continue;
+                        }
+                        llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                        llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());
+                        GGML_ASSERT(llama_set_sampler(ctx, s, chain.get()));
+                        chains.push_back(std::move(chain));
+                    }
+                    batch.clear();
+                    for (int s = 3; s >= 0; --s) {
+                        for (int pos = 0; pos < 4 + s; ++pos) {
+                            batch.add(tokens[(pos + s) % tokens.size()], pos, s, pos % 2 == 0);
+                        }
+                    }
+                    GGML_ASSERT(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+                    size_t row = 0;
+                    for (int i = 0; i < batch.size(); ++i) {
+                        if (!batch.tokens[i].output) {
+                            continue;
+                        }
+                        const int s = batch.tokens[i].seq_id;
+                        if (!backend || (mixed && s % 2)) {
+                            const auto * logits = llama_get_logits_ith(ctx, i);
+                            GGML_ASSERT(logits);
+                            const auto id = (llama_token) (std::max_element(logits, logits + test_ctx.n_vocab) - logits);
+                            if (!backend) {
+                                expected.push_back(id);
+                                expected_logits.push_back(logits[id]);
+                            } else {
+                                GGML_ASSERT(id == expected[row]);
+                                GGML_ASSERT(logits[id] == expected_logits[row]);
+                            }
+                        } else {
+                            const auto count = llama_get_sampled_logits_count_ith(ctx, i);
+                            const auto * logits = llama_get_sampled_logits_ith(ctx, i);
+                            const auto * ids = llama_get_sampled_candidates_ith(ctx, i);
+                            GGML_ASSERT(count && logits && ids);
+                            const auto n_candidates = llama_get_sampled_candidates_count_ith(ctx, i);
+                            GGML_ASSERT(n_candidates == count || (n_candidates == 0 && count == (uint32_t) test_ctx.n_vocab));
+                            const auto selected = std::max_element(logits, logits + count) - logits;
+                            GGML_ASSERT(ids[selected] == expected[row]);
+                            GGML_ASSERT(logits[selected] == expected_logits[row]);
+                            GGML_ASSERT(llama_get_sampled_token_ith(ctx, i) == expected[row]);
+                        }
+                        ++row;
+                    }
+                    for (int s = 0; backend && s < 4; ++s) {
+                        GGML_ASSERT(llama_set_sampler(ctx, s, nullptr));
+                    }
+                }
+            }
         }
     }
 }
@@ -1979,6 +2052,7 @@ struct backend_test_case {
 
 static const backend_test_case BACKEND_TESTS[] = {
     { "greedy",          test_backend_greedy_sampling,         true  },
+    { "reordered_outputs", test_backend_reordered_outputs, true },
     { "logit_bias",      test_backend_logit_bias_sampling,     true  },
     { "penalties",       test_backend_penalties_sampling,      true  },
     { "temp",            test_backend_temp_sampling,           true  },

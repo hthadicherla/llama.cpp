@@ -337,7 +337,25 @@ struct common_sampler * common_sampler_init(
         }
     }
 
-    if (params.mirostat == 0) {
+    bool batch_greedy = params.backend_sampling &&
+        params.temp == 0.0f && params.dynatemp_range == 0.0f && params.mirostat == 0 &&
+        params.n_probs == 0 && !grmr && !rbudget && samplers.empty() &&
+        params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f &&
+        params.dry_multiplier == 0.0f && params.xtc_probability == 0.0f && params.typ_p == 1.0f && params.top_n_sigma < 0.0f &&
+        params.top_p > 0.0f && params.top_p <= 1.0f && params.min_p >= 0.0f && params.min_p <= 1.0f &&
+        !params.samplers.empty() && params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE;
+    for (const auto type : params.samplers) {
+        if (type != COMMON_SAMPLER_TYPE_TOP_K && type != COMMON_SAMPLER_TYPE_TOP_P &&
+            type != COMMON_SAMPLER_TYPE_MIN_P && type != COMMON_SAMPLER_TYPE_TEMPERATURE &&
+            type != COMMON_SAMPLER_TYPE_PENALTIES && type != COMMON_SAMPLER_TYPE_DRY &&
+            type != COMMON_SAMPLER_TYPE_XTC && type != COMMON_SAMPLER_TYPE_TYPICAL_P &&
+            type != COMMON_SAMPLER_TYPE_TOP_N_SIGMA) {
+            batch_greedy = false;
+        }
+    }
+    if (batch_greedy) {
+        samplers.push_back(llama_sampler_init_greedy());
+    } else if (params.mirostat == 0) {
 
         bool use_adaptive_p = false; // see below
 

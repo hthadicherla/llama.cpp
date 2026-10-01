@@ -1042,7 +1042,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (this->params.backend_sampling && !is_dflash2) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                const bool greedy = !is_dspark && this->params.p_min <= 0.0f;
+                llama_sampler_chain_add(chain, greedy ? llama_sampler_init_greedy() : llama_sampler_init_top_k(10));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -1295,6 +1296,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
+                    if (params.p_min <= 0.0f && backend_chains[seq_id]) {
+                        const llama_token id = llama_get_sampled_token_ith(ctx_dft, beg + i);
+                        if (id != LLAMA_TOKEN_NULL) {
+                            common_sampler_accept(smpl, id, true);
+                            result.push_back(id);
+                            continue;
+                        }
+                    }
+
                     common_sampler_sample(smpl, ctx_dft, beg + i, true);
 
                     const auto * cur_p = common_sampler_get_candidates(smpl, true);
