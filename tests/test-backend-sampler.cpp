@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "llama.h"
+#include "../src/llama-ext.h"
 #include "llama-cpp.h"
 #include "common.h"
 #include "sampling.h"
@@ -2060,6 +2061,51 @@ static void test_multi_output_cpu_suffix(const test_params & params) {
     printf("backend multi-output CPU suffix test PASSED\n");
 }
 
+// Read the view first after each decode, then compare saved contents to the
+// scalar API. Cover filtered, selected-token, and CPU-logit rows in reverse order.
+static void test_sampling_view_first_read(const test_params & params) {
+    for (int mode = 0; mode < 4; ++mode) {
+        llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        if (mode == 1) {
+            llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(10));
+        } else if (mode == 2) {
+            llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());
+        } else if (mode == 3) {
+            llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(10));
+            llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(1234));
+        }
+        llama_sampler_ptr other(llama_sampler_clone(chain.get()));
+        std::vector<llama_sampler_seq_config> configs;
+        if (mode != 0) {
+            configs.push_back({0, chain.get()});
+            configs.push_back({1, other.get()});
+        }
+        test_context t(params, configs, 2);
+        for (int seq : {1, 0}) {
+            GGML_ASSERT(t.decode({{0, "Hello"}, {1, "Goodbye"}}));
+            const int idx = t.last_batch_info.at(seq);
+            const auto out = llama_get_sampling_output_ith(t.ctx.get(), idx);
+            const uint32_t n = out.probs ? out.n_probs : out.sampled_logits ? out.n_logits : t.n_vocab;
+            const float * values = out.sampled_logits ? out.sampled_logits : out.logits;
+            GGML_ASSERT(values && n > 0);
+            const std::vector<float> logits(values, values + n);
+            std::vector<float> probs;
+            std::vector<llama_token> ids;
+            if (out.probs) { probs.assign(out.probs, out.probs + out.n_probs); }
+            if (out.sampled_logits) { ids.assign(out.candidates, out.candidates + n); }
+            GGML_ASSERT(out.token == llama_get_sampled_token_ith(t.ctx.get(), idx));
+            GGML_ASSERT(out.n_probs == llama_get_sampled_probs_count_ith(t.ctx.get(), idx));
+            GGML_ASSERT(out.n_logits == llama_get_sampled_logits_count_ith(t.ctx.get(), idx));
+            const float * expected = llama_get_logits_ith(t.ctx.get(), idx);
+            GGML_ASSERT(std::all_of(logits.begin(), logits.end(), [](float v) { return std::isfinite(v); }));
+            GGML_ASSERT(std::equal(logits.begin(), logits.end(), expected));
+            if (!probs.empty()) { GGML_ASSERT(std::equal(probs.begin(), probs.end(), llama_get_sampled_probs_ith(t.ctx.get(), idx))); }
+            if (!ids.empty()) { GGML_ASSERT(std::equal(ids.begin(), ids.end(), llama_get_sampled_candidates_ith(t.ctx.get(), idx))); }
+        }
+    }
+    printf("sampling view first-read test PASSED\n");
+}
+
 struct backend_test_case {
     std::string name;
     void (*fn)(const test_params &);
@@ -2068,6 +2114,7 @@ struct backend_test_case {
 
 // note: test names are "test_<suffix>" and match the function implementing them
 static const backend_test_case BACKEND_TESTS[] = {
+    { "test_sampling_view_first_read", test_sampling_view_first_read, true },
     // single sampler
     { "test_greedy",                 test_greedy,                 true },
     { "test_greedy_filtered",        test_greedy_filtered,        true },
