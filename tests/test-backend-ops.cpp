@@ -5087,6 +5087,30 @@ struct test_ssm_scan_replay_sequence : public test_ssm_scan_replay {
     }
 };
 
+struct test_ssm_scan_replay_cache : public test_ssm_scan_replay {
+    const bool read_tail;
+
+    test_ssm_scan_replay_cache(int32_t count, bool read_tail = false, int64_t n_tokens = 1,
+                               int64_t head_dim = 64, int64_t n_head = 4, int64_t n_group = 2, int64_t n_seqs = 1,
+                               bool xbc_overlap = false, bool shared_ids = false)
+        : test_ssm_scan_replay(16, 128, head_dim, n_head, n_group, n_tokens, n_seqs, count, xbc_overlap, shared_ids), read_tail(read_tail) {}
+
+    std::string op_desc(ggml_tensor *) override { return read_tail ? "SSM_SCAN_REPLAY_CACHE_TAIL" : "SSM_SCAN_REPLAY_CACHE"; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_ssm_scan_replay::build_graph(ctx);
+        const int64_t n_y = ggml_nelements(x);
+        ggml_tensor * tail = ggml_view_2d(ctx, out, s->ne[0], n_seqs, s->nb[1], n_y*sizeof(float));
+        ggml_tensor * cache = ggml_cpy(ctx, tail, ggml_view_2d(ctx, s, s->ne[0], n_seqs, s->nb[1], 0));
+        if (read_tail) {
+            // A second consumer requires the scan to materialize its state tail.
+            cache = ggml_add(ctx, cache, tail);
+        }
+        return ggml_concat(ctx, ggml_view_1d(ctx, out, n_y, 0), ggml_reshape_1d(ctx, cache, ggml_nelements(s)), 0);
+    }
+};
+
 struct test_ssm_scan_rollback : public test_case {
     const ggml_type type;
 
@@ -11615,6 +11639,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(1, 0));
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 0));
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 15));
+    for (int32_t count : { 0, 7, 15 }) {
+        test_cases.emplace_back(new test_ssm_scan_replay_cache(count));
+    }
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(7, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(15, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(7, false, 300));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(7, false, 1, 64, 4, 2, 2));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(15, false, 1, 64, 4, 2, 2));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(7, false, 300, 64, 4, 2, 2));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(7, false, 1, 64, 4, 2, 3));
 
     // ssm_scan + cache cpy fusion
     test_cases.emplace_back(new test_ssm_scan_cache_fusion(GGML_TYPE_F32, 128, 64, 16, 2, 4, 1, 4));
@@ -13724,6 +13758,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 512, 1)); // Nemotron-9B prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 1,   1)); // Nemotron-9B generate
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 96, 8, 1, 1)); // Nemotron-3-Nano-4B
+    for (int32_t count : { 0, 7, 15 }) {
+        test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 80, 96, 8, 1, 1, count));
+    }
 
     // acc
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 1, 1}, {256, 16, 1, 1}, -1));
