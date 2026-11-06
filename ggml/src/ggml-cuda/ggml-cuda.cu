@@ -2804,6 +2804,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SSM_SCAN:
             ggml_cuda_op_ssm_scan(ctx, dst);
             break;
+        case GGML_OP_SSM_SCAN_REPLAY:
+            ggml_cuda_op_ssm_scan_replay(ctx, dst);
+            break;
         case GGML_OP_TOP_K:
             ggml_cuda_op_top_k(ctx, dst);
             break;
@@ -3299,18 +3302,19 @@ static int ggml_cuda_try_ssm_scan_cache_fusion(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_ssm_scan_fused_cache & fused_state_cpy) {
     const ggml_tensor * ssm = cgraph->nodes[node_idx];
     // the kernel skips the snapshot tail, so the scan output must not be a graph output
-    if (ssm->op != GGML_OP_SSM_SCAN || ssm->type != GGML_TYPE_F32 || (ssm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+    const bool replay = ssm->op == GGML_OP_SSM_SCAN_REPLAY;
+    if ((!replay && ssm->op != GGML_OP_SSM_SCAN) || ssm->type != GGML_TYPE_F32 || (ssm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return 0;
     }
 
-    const int64_t K = ggml_get_op_params_i32(ssm, 0); // snapshot slot count
+    const int64_t K = replay ? 1 : ggml_get_op_params_i32(ssm, 0); // snapshot slot count
 
     const ggml_tensor * s = ssm->src[0];
     const ggml_tensor * x = ssm->src[1];
     const ggml_tensor * A = ssm->src[3];
 
-    const int64_t d_state = s->ne[0];
-    const int64_t D       = d_state * s->ne[1] * x->ne[1]; // d_state * head_dim * n_head
+    const int64_t d_state = replay ? ssm->src[4]->ne[0] : s->ne[0];
+    const int64_t D       = replay ? s->ne[0] : d_state * s->ne[1] * x->ne[1];
     const int64_t n_tok   = x->ne[2];
     const int64_t n_seqs  = x->ne[3];
 
@@ -3319,8 +3323,8 @@ static int ggml_cuda_try_ssm_scan_cache_fusion(
         return 0;
     }
 
-    // the scan reads its input rows from the cache (picked by ids), so with more than one seq a seq can read a row that another seq writes in the same launch
-    if (n_seqs != 1) {
+    // The ordinary scan can overwrite another sequence's input row. Replay stages batched writes first.
+    if (!replay && n_seqs != 1) {
         return 0;
     }
 
@@ -3360,6 +3364,36 @@ static int ggml_cuda_try_ssm_scan_cache_fusion(
         !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
         dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
         return 0;
+    }
+
+    if (replay) {
+        const ggml_tensor * s_base = s->view_src ? s->view_src : s;
+        const size_t s_off = s->view_src ? s->view_offs : 0;
+        if (dst->view_src != s_base || dst->view_offs < s_off ||
+            (dst->view_offs - s_off) % s->nb[1] != 0) {
+            return 0;
+        }
+        // The fused replay leaves its state tail unwritten. Only the matched copy may read it.
+        auto reads_tail = [&](const ggml_tensor * t) {
+            return t == ssm || (t && t->view_src == ssm &&
+                (t->view_offs > tail_off || ggml_nbytes(t) > tail_off - t->view_offs));
+        };
+        for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (n == cpy) {
+                continue;
+            }
+            if ((n->flags & GGML_TENSOR_FLAG_OUTPUT) && reads_tail(n)) {
+                return 0;
+            }
+            if (!ggml_cuda_is_view_or_noop(n)) {
+                for (const ggml_tensor * input : n->src) {
+                    if (reads_tail(input)) {
+                        return 0;
+                    }
+                }
+            }
+        }
     }
 
     fused_state_cpy.data        = (float *) dst->data; // rollback slot 0 (newest)
@@ -4146,7 +4180,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // ssm_scan -> cpy: scatter recurrent-state snapshots into the cache
-    if (node->op == GGML_OP_SSM_SCAN) {
+    if (node->op == GGML_OP_SSM_SCAN || node->op == GGML_OP_SSM_SCAN_REPLAY) {
         ggml_cuda_ssm_scan_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_ssm_scan_cache_fusion(cgraph, i, fused_state_cpy);
         if (nodes_to_skip > 0) {
@@ -4154,7 +4188,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             GGML_LOG_INFO("%s: fused ssm_scan snapshot copies for %s (skipped %d nodes)\n",
                           __func__, node->name, nodes_to_skip);
 #endif
-            ggml_cuda_op_ssm_scan_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            if (node->op == GGML_OP_SSM_SCAN_REPLAY) {
+                ggml_cuda_op_ssm_scan_replay(*cuda_ctx, node, &fused_state_cpy);
+            } else {
+                ggml_cuda_op_ssm_scan_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            }
             return nodes_to_skip;
         }
     }
@@ -6247,6 +6285,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                    (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
                    (op->type         == GGML_TYPE_F32 || op->type         == GGML_TYPE_F16);
+        case GGML_OP_SSM_SCAN_REPLAY: {
+            const int64_t d_state = op->src[4]->ne[0];
+            if (op->type != GGML_TYPE_F32 || op->src[6]->type != GGML_TYPE_I32 || op->src[3]->ne[0] != 1 ||
+                ggml_get_op_params_i32(op, 0) < 1 || ggml_get_op_params_i32(op, 0) > 32 ||
+                (d_state != 96 && d_state != 128 && d_state != 256) || op->src[1]->ne[0] % 16 != 0) {
+                return false;
+            }
+            for (int i = 0; i < 6; ++i) {
+                if (op->src[i]->type != GGML_TYPE_F32 || op->src[i]->nb[0] != sizeof(float)) {
+                    return false;
+                }
+            }
+            return true;
+        }
         case GGML_OP_SSM_SCAN: {
             const int32_t K = ggml_get_op_params_i32(op, 0);
 

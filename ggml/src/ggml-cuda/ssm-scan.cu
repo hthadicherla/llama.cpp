@@ -888,3 +888,313 @@ void ggml_cuda_op_ssm_scan_fused_cache(ggml_backend_cuda_context & ctx, ggml_ten
                                        ggml_cuda_ssm_scan_fused_cache cache) {
     ggml_cuda_op_ssm_scan_impl(ctx, dst, &cache);
 }
+
+struct ssm_replay_params {
+    int64_t d_state, head_dim, n_head, n_group, window, row, slots;
+    int64_t s_stride, x_head, x_seq, dt_seq, A_head, B_group, B_seq, C_group, C_seq;
+};
+
+static __device__ int ssm_replay_count(const float * row, const ssm_replay_params & p) {
+    const float value = row[p.row - 1];
+    if (!(value >= 0.0f && value < p.window && value == truncf(value))) {
+        __trap();
+    }
+    return (int) value;
+}
+
+static __global__ void ssm_replay_precompute(
+        const float * s, const float * B, const float * C, const int32_t * ids,
+        float * bc, const ssm_replay_params p) {
+    const int seq = blockIdx.y;
+    const int group = blockIdx.x;
+    if (ids[seq] < 0 || ids[seq] >= p.slots) {
+        __trap();
+    }
+    const float * src = s + ids[seq] * p.s_stride;
+    const int count = ssm_replay_count(src, p);
+    if (count + 1 == p.window) {
+        return;
+    }
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int64_t inner = p.head_dim * p.n_head;
+    const int64_t D = p.d_state * inner;
+    const int64_t record = inner + p.n_head + p.d_state * p.n_group;
+    const float * q = C + seq * p.C_seq + group * p.C_group;
+    for (int j = warp; j <= count; j += blockDim.x / WARP_SIZE) {
+        const float * key = j == count ? B + seq * p.B_seq + group * p.B_group :
+            src + D + j * record + inner + p.n_head + group * p.d_state;
+        float dot = 0.0f;
+        for (int i = lane; i < p.d_state; i += WARP_SIZE) {
+            dot += key[i] * q[i];
+        }
+        dot = warp_reduce_sum(dot);
+        if (lane == 0) {
+            bc[(seq * p.n_group + group) * p.window + j] = dot;
+        }
+    }
+}
+
+template <int d_state>
+static __global__ void ssm_replay_scan(
+        const float * s, const float * x, const float * dt, const float * A,
+        const float * B, const float * C, const int32_t * ids, const float * bc,
+        float * y, float * out, const float * cache, int32_t * metadata,
+        const ssm_replay_params p, const bool materialize) {
+    const int seq  = blockIdx.y;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int n_warps = blockDim.x / WARP_SIZE;
+    const int n_tiles = (p.head_dim + n_warps - 1) / n_warps;
+    const int head = blockIdx.x / n_tiles;
+    const int channel = (blockIdx.x % n_tiles) * n_warps + warp;
+    const int group = head / (p.n_head / p.n_group);
+    const int64_t inner = p.head_dim * p.n_head;
+    const int64_t D = p.d_state * inner;
+    const int64_t record = inner + p.n_head + p.d_state * p.n_group;
+    if (ids[seq] < 0 || ids[seq] >= p.slots) {
+        __trap();
+    }
+    const float * src = s + ids[seq] * p.s_stride;
+    float * dst = out + seq * (materialize ? D : p.row);
+    const int count = ssm_replay_count(src, p);
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        // Snapshot pending counts for decode, or use dense identity rows for prefill.
+        metadata[seq] = materialize ? seq : count;
+    }
+    const int n_steps = materialize ? count : count + 1;
+    const bool flush = materialize || n_steps == p.window;
+    const float * q = C + seq * p.C_seq + group * p.C_group;
+    const float * k = B + seq * p.B_seq + group * p.B_group;
+    const float * v = x + seq * p.x_seq + head * p.x_head;
+
+    __shared__ float scale[32];
+    __shared__ float total_decay;
+    if (warp == 0) {
+        float step = 0.0f;
+        if (lane < n_steps && lane == count) {
+            const float dt_cur = dt[seq * p.dt_seq + head];
+            step = dt_cur <= 20.0f ? log1pf(expf(dt_cur)) : dt_cur;
+        } else if (lane < n_steps) {
+            step = src[D + lane * record + inner + head];
+        }
+        const float prefix = warp_prefix_inclusive_sum(step);
+        const float total = warp_reduce_sum(step);
+        const float a = A[head * p.A_head];
+        if (lane < n_steps) {
+            // The last input has no following decay; avoid cancellation for large A * dt.
+            scale[lane] = lane == n_steps - 1 ? step : step * expf(a * (total - prefix));
+        }
+        if (lane == 0) {
+            total_decay = n_steps == 0 ? 1.0f : expf(a * total);
+        }
+    }
+    __syncthreads();
+
+    if (channel < p.head_dim) {
+        const int64_t col = head * p.head_dim + channel;
+        float state[d_state / WARP_SIZE];
+#pragma unroll
+        for (int i = 0; i < d_state / WARP_SIZE; ++i) {
+            const int64_t offset = col * d_state + i * WARP_SIZE + lane;
+            state[i] = src[offset];
+            if (!flush && src != (cache ? cache + seq * p.row : dst)) {
+                dst[offset] = state[i];
+            }
+        }
+        if (flush && n_steps > 0) {
+            float delta[d_state / WARP_SIZE] = {};
+            for (int j = 0; j < n_steps; ++j) {
+                const float * rec = src + D + j * record;
+                const float * key = j == count ? k : rec + inner + p.n_head + group * d_state;
+                const float val = j == count ? v[channel] : rec[col];
+#pragma unroll
+                for (int i = 0; i < d_state / WARP_SIZE; ++i) {
+                    const float scaled_B = key[i * WARP_SIZE + lane] * scale[j];
+                    delta[i] = fmaf(val, scaled_B, delta[i]);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < d_state / WARP_SIZE; ++i) {
+                state[i] = fmaf(state[i], total_decay, delta[i]);
+            }
+        }
+        float dot = 0.0f;
+#pragma unroll
+        for (int i = 0; i < d_state / WARP_SIZE; ++i) {
+            if (!materialize) {
+                dot += state[i] * q[i * WARP_SIZE + lane];
+            }
+            if (flush) {
+                dst[col * d_state + i * WARP_SIZE + lane] = state[i];
+            }
+        }
+        if (!materialize) {
+            dot = warp_reduce_sum(dot);
+            if (lane == 0) {
+                if (!flush) {
+                    float update = 0.0f;
+                    for (int j = 0; j < n_steps; ++j) {
+                        const float val = j == count ? v[channel] : src[D + j * record + col];
+                        update += val * (scale[j] * bc[(seq * p.n_group + group) * p.window + j]);
+                    }
+                    dot = fmaf(dot, total_decay, update);
+                }
+                y[seq * inner + col] = dot;
+            }
+        }
+    }
+}
+
+// Update history after every head has finished reading the previous count and records.
+static __global__ void ssm_replay_store(
+        const float * s, const float * x, const float * dt, const float * B, const int32_t * ids, const int32_t * counts,
+        float * out, const ssm_replay_params p) {
+    const int seq = blockIdx.y;
+    const int64_t inner = p.head_dim * p.n_head;
+    const int64_t D = p.d_state * inner;
+    const int64_t record = inner + p.n_head + p.d_state * p.n_group;
+    const float * src = s + ids[seq] * p.s_stride;
+    float * dst = out + seq * p.row;
+    const int count = counts[seq];
+    const bool flush = count + 1 == p.window;
+    const int64_t begin = src == dst && !flush ? count * record : 0;
+    const int64_t end = src == dst && !flush ? (count + 1) * record : p.window * record;
+    for (int64_t i = begin + blockIdx.x * blockDim.x + threadIdx.x; i < end; i += blockDim.x * gridDim.x) {
+        if (flush) {
+            dst[D + i] = 0.0f;
+        } else if (i >= count * record && i < (count + 1) * record) {
+            const int64_t j = i - count * record;
+            if (j < inner) {
+                dst[D + i] = x[seq * p.x_seq + (j / p.head_dim) * p.x_head + j % p.head_dim];
+            } else if (j < inner + p.n_head) {
+                const float val = dt[seq * p.dt_seq + j - inner];
+                dst[D + i] = val <= 20.0f ? log1pf(expf(val)) : val;
+            } else {
+                const int64_t k = j - inner - p.n_head;
+                dst[D + i] = B[seq * p.B_seq + (k / p.d_state) * p.B_group + k % p.d_state];
+            }
+        } else if (src != dst) {
+            dst[D + i] = src[D + i];
+        }
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        dst[p.row - 1] = flush ? 0.0f : (float) (count + 1);
+    }
+}
+
+// All source rows have been read before committing a batch that can move or share cache rows.
+static __global__ void ssm_replay_commit(
+        const float * staged, const float * s, const int32_t * ids, float * cache, const ssm_replay_params p) {
+    const int seq = blockIdx.y;
+    const float * src = staged + seq * p.row;
+    float * dst = cache + seq * p.row;
+    const bool copy_state = src[p.row - 1] == 0.0f || s + ids[seq] * p.s_stride != dst;
+    const int64_t begin = copy_state ? 0 : p.d_state * p.head_dim * p.n_head;
+    for (int64_t i = begin + blockIdx.x * blockDim.x + threadIdx.x; i < p.row; i += blockDim.x * gridDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+void ggml_cuda_op_ssm_scan_replay(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                const ggml_cuda_ssm_scan_fused_cache * cache) {
+    const ggml_tensor * s   = dst->src[0];
+    const ggml_tensor * x   = dst->src[1];
+    const ggml_tensor * dt  = dst->src[2];
+    const ggml_tensor * A   = dst->src[3];
+    const ggml_tensor * B   = dst->src[4];
+    const ggml_tensor * C   = dst->src[5];
+    const ggml_tensor * ids = dst->src[6];
+    const int64_t n_seq = x->ne[3];
+    const int64_t n_tok = x->ne[2];
+    const int64_t D = B->ne[0] * x->ne[0] * x->ne[1];
+    const int64_t n_y = ggml_nelements(x);
+    const ssm_replay_params p = {
+        B->ne[0], x->ne[0], x->ne[1], B->ne[1], ggml_get_op_params_i32(dst, 0), s->ne[0], s->ne[1],
+        (int64_t) (s->nb[1] / sizeof(float)), (int64_t) (x->nb[1] / sizeof(float)), (int64_t) (x->nb[3] / sizeof(float)),
+        (int64_t) (dt->nb[2] / sizeof(float)), (int64_t) (A->nb[1] / sizeof(float)),
+        (int64_t) (B->nb[1] / sizeof(float)), (int64_t) (B->nb[3] / sizeof(float)),
+        (int64_t) (C->nb[1] / sizeof(float)), (int64_t) (C->nb[3] / sizeof(float)),
+    };
+    cudaStream_t stream = ctx.stream();
+    float * out = cache ? cache->data : (float *) dst->data + n_y;
+    // Prefill needs the current state after applying all pending updates.
+    const bool materialize = n_tok > 1;
+    ggml_cuda_pool_alloc<int32_t> metadata(ctx.pool(), n_seq); // pending counts or materialized row ids
+    ggml_cuda_pool_alloc<float> bc_buf(ctx.pool());
+    ggml_cuda_pool_alloc<float> state_buf(ctx.pool());
+    const int threads = 4 * ggml_cuda_info().devices[ctx.device].warp_size;
+    float * staged = cache && n_seq > 1 ? (float *) dst->data + n_y : out;
+    if (materialize) {
+        staged = state_buf.alloc(D * n_seq);
+    } else {
+        bc_buf.alloc(n_seq * p.n_group * p.window);
+        ssm_replay_precompute<<<dim3(p.n_group, n_seq), threads, 0, stream>>>(
+            (const float *) s->data, (const float *) B->data, (const float *) C->data,
+            (const int32_t *) ids->data, bc_buf.get(), p);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    const dim3 blocks(p.n_head * ((p.head_dim + threads / WARP_SIZE - 1) / (threads / WARP_SIZE)), n_seq);
+    if (p.d_state == 96) {
+        ssm_replay_scan<96><<<blocks, threads, 0, stream>>>(
+            (const float *) s->data, (const float *) x->data, (const float *) dt->data, (const float *) A->data,
+            (const float *) B->data, (const float *) C->data, (const int32_t *) ids->data, bc_buf.get(),
+            (float *) dst->data, staged, cache ? cache->data : nullptr, metadata.get(), p, materialize);
+    } else if (p.d_state == 128) {
+        ssm_replay_scan<128><<<blocks, threads, 0, stream>>>(
+            (const float *) s->data, (const float *) x->data, (const float *) dt->data, (const float *) A->data,
+            (const float *) B->data, (const float *) C->data, (const int32_t *) ids->data, bc_buf.get(),
+            (float *) dst->data, staged, cache ? cache->data : nullptr, metadata.get(), p, materialize);
+    } else {
+        GGML_ASSERT(p.d_state == 256);
+        ssm_replay_scan<256><<<blocks, threads, 0, stream>>>(
+            (const float *) s->data, (const float *) x->data, (const float *) dt->data, (const float *) A->data,
+            (const float *) B->data, (const float *) C->data, (const int32_t *) ids->data, bc_buf.get(),
+            (float *) dst->data, staged, cache ? cache->data : nullptr, metadata.get(), p, materialize);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    if (n_tok == 1) {
+        ssm_replay_store<<<dim3(128, n_seq), 256, 0, stream>>>(
+            (const float *) s->data, (const float *) x->data, (const float *) dt->data,
+            (const float *) B->data, (const int32_t *) ids->data, metadata.get(), staged, p);
+        CUDA_CHECK(cudaGetLastError());
+        if (staged != out) {
+            ssm_replay_commit<<<dim3(128, n_seq), 256, 0, stream>>>(
+                staged, (const float *) s->data, (const int32_t *) ids->data, out, p);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        return;
+    }
+
+    ggml_tensor state = *s;
+    state.data = state_buf.get();
+    state.ne[0] = p.d_state;
+    state.ne[1] = p.head_dim;
+    state.ne[2] = p.n_head;
+    state.ne[3] = n_seq;
+    state.nb[0] = sizeof(float);
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        state.nb[i] = state.nb[i - 1] * state.ne[i - 1];
+    }
+    ggml_tensor identity = *ids;
+    identity.data = metadata.get();
+    ggml_tensor scan = *dst;
+    scan.op = GGML_OP_SSM_SCAN;
+    scan.src[0] = &state;
+    scan.src[6] = &identity;
+    scan.ne[0] = n_y + D * n_seq;
+    scan.nb[1] = scan.nb[2] = scan.nb[3] = scan.ne[0] * sizeof(float);
+    ggml_set_op_params_i32(&scan, 0, 1);
+    ggml_cuda_pool_alloc<float> scan_buf(ctx.pool());
+    if (n_seq > 1) {
+        scan_buf.alloc(scan.ne[0]);
+        scan.data = scan_buf.get();
+    }
+    ggml_cuda_op_ssm_scan_impl(ctx, &scan, n_seq == 1 ? cache : nullptr);
+    if (n_seq > 1) {
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, scan.data, n_y * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(out, p.row * sizeof(float), scan_buf.get() + n_y, D * sizeof(float),
+                                   D * sizeof(float), n_seq, cudaMemcpyDeviceToDevice, stream));
+    }
+    CUDA_CHECK(cudaMemset2DAsync(out + D, p.row * sizeof(float), 0, (p.row - D) * sizeof(float), n_seq, stream));
+}
