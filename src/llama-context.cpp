@@ -208,6 +208,15 @@ llama_context::llama_context(
         cparams.n_rs_seq = 0;
     }
 
+    cparams.ssm_replay_window = params.ssm_replay_window;
+    if (cparams.ssm_replay_window > 32) {
+        throw std::runtime_error("ssm_replay_window must be between 0 and 32");
+    }
+    if (cparams.ssm_replay_window > 0 && cparams.n_rs_seq > 0) {
+        LLAMA_LOG_WARN("%s: ReplaySSM disabled with recurrent-state rollback\n", __func__);
+        cparams.ssm_replay_window = 0;
+    }
+
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
@@ -4251,6 +4260,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
+        /*.ssm_replay_window           =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default

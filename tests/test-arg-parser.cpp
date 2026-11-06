@@ -182,6 +182,24 @@ static void test(void) {
 
     std::vector<std::string> argv;
 
+    {
+        for (int window : { 0, 1, 32 }) {
+            common_params replay;
+            argv = {"binary_name", "--model", "dummy.gguf"};
+            if (window) { argv.insert(argv.end(), {"--replayssm-buffer-len", std::to_string(window)}); }
+            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), replay, LLAMA_EXAMPLE_COMMON));
+            assert(common_context_params_to_llama(replay).ssm_replay_window == 0);
+            argv.push_back("--use-replayssm");
+            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), replay, LLAMA_EXAMPLE_COMMON));
+            assert(common_context_params_to_llama(replay).ssm_replay_window == (window ? window : 16));
+        }
+        for (const char * value : { "0", "33", "-1" }) {
+            common_params replay;
+            argv = {"binary_name", "--model", "dummy.gguf", "--replayssm-buffer-len", value};
+            assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), replay, LLAMA_EXAMPLE_COMMON));
+        }
+    }
+
     printf("test-arg-parser: test invalid usage\n\n");
 
     // missing value

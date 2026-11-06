@@ -1115,9 +1115,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "SSM_SCAN_REPLAY",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1231,9 +1232,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "ssm_scan_replay(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5865,6 +5867,66 @@ struct ggml_tensor * ggml_ssm_scan(
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
 
+    return result;
+}
+
+struct ggml_tensor * ggml_ssm_scan_replay(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * dt,
+        struct ggml_tensor  * A,
+        struct ggml_tensor  * B,
+        struct ggml_tensor  * C,
+        struct ggml_tensor  * ids,
+        int32_t               window) {
+    GGML_ASSERT(window >= 1 && window <= 32);
+    GGML_ASSERT(s->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && dt->type == GGML_TYPE_F32);
+    GGML_ASSERT(A->type == GGML_TYPE_F32 && B->type == GGML_TYPE_F32 && C->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_vector(ids) && ggml_is_contiguous(ids));
+    GGML_ASSERT(ggml_is_matrix(s) && ggml_is_contiguous(s));
+    GGML_ASSERT(ggml_is_3d(dt) && ggml_is_contiguous(dt));
+    GGML_ASSERT(ggml_is_matrix(A) && ggml_is_contiguous(A));
+    GGML_ASSERT(x->nb[0] == sizeof(float) && x->nb[1] == x->ne[0]*sizeof(float));
+    GGML_ASSERT(B->nb[0] == sizeof(float) && B->nb[1] == B->ne[0]*sizeof(float));
+    GGML_ASSERT(C->nb[0] == sizeof(float) && C->nb[1] == C->ne[0]*sizeof(float));
+    GGML_ASSERT(ggml_are_same_shape(B, C));
+
+    const int64_t d_state = B->ne[0];
+    const int64_t n_group = B->ne[1];
+    const int64_t n_head  = x->ne[1];
+    GGML_ASSERT(d_state > 0 && n_group > 0 && n_head > 0 && x->ne[0] > 0);
+    GGML_ASSERT(x->ne[2] > 0 && x->ne[3] > 0 && s->ne[1] > 0);
+    GGML_ASSERT(n_head % n_group == 0);
+    GGML_ASSERT(x->ne[0] <= INT64_MAX / n_head);
+    const int64_t d_inner = x->ne[0]*n_head;
+    GGML_ASSERT(d_state <= INT64_MAX / d_inner);
+    GGML_ASSERT(d_state <= (INT64_MAX - d_inner - n_head) / n_group);
+    const int64_t n_state  = d_state*d_inner;
+    const int64_t n_record = d_inner + n_head + d_state*n_group;
+    GGML_ASSERT(n_record <= (INT64_MAX - n_state - 1) / window);
+    GGML_ASSERT(s->ne[0] == n_state + window*n_record + 1);
+    GGML_ASSERT(dt->ne[0] == n_head && dt->ne[1] == x->ne[2] && dt->ne[2] == x->ne[3]);
+    GGML_ASSERT(A->ne[0] == 1 && A->ne[1] == n_head);
+    GGML_ASSERT(B->ne[2] == x->ne[2] && B->ne[3] == x->ne[3]);
+    GGML_ASSERT(ids->ne[0] == x->ne[3]);
+    GGML_ASSERT(x->ne[2] <= INT64_MAX / d_inner);
+    GGML_ASSERT(x->ne[3] <= INT64_MAX / (d_inner*x->ne[2]));
+    const int64_t n_y = d_inner*x->ne[2]*x->ne[3];
+    GGML_ASSERT(s->ne[0] <= (INT64_MAX - n_y) / ids->ne[0]);
+    const int64_t n_output = n_y + s->ne[0]*ids->ne[0];
+    GGML_ASSERT((uint64_t) n_output <= (SIZE_MAX - GGML_MEM_ALIGN) / sizeof(float));
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_output);
+    result->op     = GGML_OP_SSM_SCAN_REPLAY;
+    result->src[0] = s;
+    result->src[1] = x;
+    result->src[2] = dt;
+    result->src[3] = A;
+    result->src[4] = B;
+    result->src[5] = C;
+    result->src[6] = ids;
+    ggml_set_op_params_i32(result, 0, window);
     return result;
 }
 

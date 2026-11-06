@@ -242,6 +242,15 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         // (this is necessary in order to properly use the states before they are overwritten,
         //  while avoiding to make unnecessary copies of the states)
         auto get_ssm_rows = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
+            if (states->ne[0] != hparams.n_embd_s()) {
+                GGML_ASSERT(K == 1);
+                const int64_t n_record = d_inner + n_head + d_state*n_group;
+                const int64_t n_history = states->ne[0] - d_state*d_inner - 1;
+                GGML_ASSERT(n_history > 0 && n_history % n_record == 0);
+                const int64_t window = n_history / n_record;
+                GGML_ASSERT(window >= 1 && window <= 32);
+                return ggml_ssm_scan_replay(ctx, states, x, dt, A, B, C, ids, (int32_t) window);
+            }
             ggml_tensor * ssm = ggml_reshape_4d(ctx, states, d_state, head_dim, n_head, state_slots);
 
             // TODO: use semistructured matrices to implement state-space duality
@@ -250,8 +259,8 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
             return ggml_ssm_scan(ctx, ssm, x, dt, A, B, C, ids, K);
         };
 
-        ggml_tensor * y_ssm = build_rs(inp, ssm_states_all, hparams.n_embd_s(), ubatch.n_seqs, get_ssm_rows);
-        const int64_t D            = d_state * d_inner;
+        ggml_tensor * y_ssm = build_rs(inp, ssm_states_all, ssm_states_all->ne[0], ubatch.n_seqs, get_ssm_rows);
+        const int64_t D            = ssm_states_all->ne[0];
         const int64_t n_written    = std::min<int64_t>(n_seq_tokens, K);
         const size_t  row_size     = ggml_row_size(ssm_states_all->type, D);
         const size_t  y_row_size   = ggml_row_size(y_ssm->type, D);

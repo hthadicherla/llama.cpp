@@ -2431,6 +2431,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--use-replayssm"},
+        "enable ReplaySSM for Mamba2 layers (experimental, default: disabled)",
+        [](common_params & params) {
+            params.use_replayssm = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--replayssm-buffer-len"}, "N",
+        string_format("ReplaySSM window, 1..32; requires --use-replayssm (default: %d)", params.replayssm_buffer_len),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 32) {
+                throw std::invalid_argument("ReplaySSM window must be between 1 and 32");
+            }
+            params.replayssm_buffer_len = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {
