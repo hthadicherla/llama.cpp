@@ -25,7 +25,8 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
-        const layer_filter_cb & filter);
+        const layer_filter_cb & filter,
+                     uint32_t   replay_window = 0);
 
     ~llama_memory_recurrent() = default;
 
@@ -141,7 +142,7 @@ private:
     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
-    bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+    bool state_read_data(llama_io_read_i & io, uint32_t cell_count, llama_state_seq_flags flags);
 
     void state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count);
 };
@@ -177,6 +178,7 @@ public:
     //
 
     uint32_t get_n_rs() const;
+    bool get_is_full() const;
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
     uint32_t get_size() const;

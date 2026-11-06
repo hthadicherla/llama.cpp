@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -26,7 +27,8 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-    const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max), ctxs_bufs(no_alloc) {
+    const layer_filter_cb & filter,
+                 uint32_t   replay_window) : hparams(model.hparams), n_seq_max(n_seq_max), ctxs_bufs(no_alloc) {
     const int32_t n_layer = hparams.n_layer();
 
     head = 0;
@@ -35,6 +37,8 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+
+    const bool replay = replay_window > 0 && n_rs_seq == 0 && type_s == GGML_TYPE_F32 && hparams.ssm_n_group > 0;
 
     cells.clear();
     cells.resize(mem_size);
@@ -99,9 +103,28 @@ llama_memory_recurrent::llama_memory_recurrent(
             throw std::runtime_error("failed to create ggml context for rs cache");
         }
 
+        int64_t n_embd_s = hparams.n_embd_s();
+        const auto & layer = model.layers[i];
+        if (replay && layer.ssm_in && layer.ssm_d && layer.ssm_a && layer.ssm_a->ne[0] == 1 && layer.ssm_a->ne[1] == hparams.ssm_dt_rank) {
+            const uint64_t d_inner = hparams.ssm_d_inner;
+            const uint64_t d_state = hparams.ssm_d_state;
+            const uint64_t n_head  = hparams.ssm_dt_rank;
+            const uint64_t n_group = hparams.ssm_n_group;
+            if (n_head == 0 || d_inner == 0 || d_state == 0 || d_inner % n_head != 0 || n_head % n_group != 0 || d_state * d_inner >= INT32_MAX) {
+                throw std::runtime_error("invalid ReplaySSM state dimensions");
+            }
+            const uint64_t record_size = d_inner + n_head + d_state * n_group;
+            const uint64_t state_size = d_state * d_inner + replay_window * record_size + 1;
+            if (state_size > INT32_MAX) {
+                throw std::runtime_error("ReplaySSM state row is too large");
+            }
+            n_embd_s = state_size;
+            LLAMA_LOG_DEBUG("%s: layer %3d: ReplaySSM window = %u\n", __func__, i, replay_window);
+        }
+
         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, n_embd_s, n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
@@ -862,8 +885,6 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    GGML_UNUSED(flags);
-
     uint32_t cell_count;
     io.read(&cell_count, sizeof(cell_count));
 
@@ -877,7 +898,7 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     res = res && meta_read;
 
     try {
-        res = res && state_read_data(io, cell_count);
+        res = res && state_read_data(io, cell_count, flags);
     } catch (...) {
         res = false;
     }
@@ -962,7 +983,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             io.write(&s_type_i, sizeof(s_type_i));
 
             // Write row size of S tensor
-            const uint64_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            const uint64_t s_size_row = ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
             io.write(&s_size_row, sizeof(s_size_row));
 
             // Write each logical cell row range. With pending recurrent rollback,
@@ -980,7 +1001,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
             if (s_l[il] == nullptr) continue;
 
-            const uint32_t n_embd_s = hparams.n_embd_s();
+            const uint32_t n_embd_s = s_l[il]->ne[0];
 
             // Write S tensor type
             const int32_t s_type_i = (int32_t)s_l[il]->type;
@@ -1107,7 +1128,7 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
     return true;
 }
 
-bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell_count) {
+bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell_count, llama_state_seq_flags flags) {
     uint32_t s_trans;
     uint32_t n_layer;
     io.read(&s_trans, sizeof(s_trans));
@@ -1187,15 +1208,29 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             // Read row size of value
             uint64_t s_size_row_ref;
             io.read(&s_size_row_ref, sizeof(s_size_row_ref));
-            const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            const size_t s_size_row = ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
             if (s_size_row != s_size_row_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched s row size (%zu != %zu, layer %d)\n", __func__, s_size_row, (size_t) s_size_row_ref, il);
                 return false;
             }
 
             if (cell_count) {
-                // Read and set the values for the whole cell range
-                io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
+                if (s_l[il]->ne[0] != hparams.n_embd_s() && !(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+                    const int64_t record_size = hparams.ssm_d_inner + hparams.ssm_dt_rank + int64_t(hparams.ssm_d_state)*hparams.ssm_n_group;
+                    const int64_t window = (s_l[il]->ne[0] - hparams.n_embd_s() - 1)/record_size;
+                    std::vector<float> row(s_l[il]->ne[0]);
+                    for (uint32_t i = 0; i < cell_count; ++i) {
+                        io.read(row.data(), s_size_row);
+                        const float count = row.back();
+                        if (!(count >= 0 && count < window && count == std::floor(count))) {
+                            LLAMA_LOG_ERROR("%s: invalid ReplaySSM history count (layer %u)\n", __func__, il);
+                            return false;
+                        }
+                        ggml_backend_tensor_set(s_l[il], row.data(), (head + i)*s_size_row, s_size_row);
+                    }
+                } else {
+                    io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
+                }
             }
         }
     } else {
@@ -1204,7 +1239,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             // skip null layers
             if (s_l[il] == nullptr) continue;
 
-            const uint32_t n_embd_s = hparams.n_embd_s();
+            const uint32_t n_embd_s = s_l[il]->ne[0];
 
             // Read type of value
             int32_t s_type_i_ref;
@@ -1269,7 +1304,7 @@ void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head
         }
 
         if (s_l[il] != nullptr) {
-            const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            const size_t s_size_row = ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
             llama_clear_tensor_data(s_l[il], cell_head * s_size_row, cell_count * s_size_row);
         }
 
@@ -1334,6 +1369,10 @@ const llama_ubatch & llama_memory_recurrent_context::get_ubatch() const {
 
 uint32_t llama_memory_recurrent_context::get_n_rs() const {
     return is_full ? mem->size : mem->n;
+}
+
+bool llama_memory_recurrent_context::get_is_full() const {
+    return is_full;
 }
 
 uint32_t llama_memory_recurrent_context::get_head() const {

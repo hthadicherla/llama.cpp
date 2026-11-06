@@ -10248,6 +10248,140 @@ void ggml_compute_forward_ssm_scan(
     }
 }
 
+void ggml_compute_forward_ssm_scan_replay(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src_s  = dst->src[0];
+    const ggml_tensor * src_x  = dst->src[1];
+    const ggml_tensor * src_dt = dst->src[2];
+    const ggml_tensor * src_A  = dst->src[3];
+    const ggml_tensor * src_B  = dst->src[4];
+    const ggml_tensor * src_C  = dst->src[5];
+    const ggml_tensor * ids    = dst->src[6];
+
+    const int64_t nc = src_B->ne[0];
+    const int64_t ng = src_B->ne[1];
+    const int64_t nr = src_x->ne[0];
+    const int64_t nh = src_x->ne[1];
+    const int64_t nt = src_x->ne[2];
+    const int64_t ns = src_x->ne[3];
+    const int64_t ni = nr*nh;
+    const int64_t n_state  = nc*ni;
+    const int64_t n_record = ni + nh + nc*ng;
+    const int64_t n_row    = src_s->ne[0];
+    const int32_t window  = ggml_get_op_params_i32(dst, 0);
+
+    GGML_ASSERT(window >= 1 && window <= 32);
+    for (int i = 0; i < 6; ++i) {
+        GGML_ASSERT(dst->src[i]->type == GGML_TYPE_F32);
+    }
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_row == n_state + window*n_record + 1);
+
+    for (int64_t seq = 0; seq < ns; ++seq) {
+        const int32_t slot = ((const int32_t *) ids->data)[seq];
+        GGML_ASSERT(slot >= 0 && slot < src_s->ne[1]);
+        const float * s0 = (const float *) ((const char *) src_s->data + slot*src_s->nb[1]);
+        float * s = (float *) dst->data + ggml_nelements(src_x) + seq*n_row;
+        GGML_ASSERT(s0[n_row - 1] >= 0 && s0[n_row - 1] < window);
+        const int32_t count = (int32_t) s0[n_row - 1];
+        GGML_ASSERT(s0[n_row - 1] == (float) count);
+        const bool flush = nt > 1 || count + 1 == window;
+
+        if (params->ith == 0) {
+            memcpy(s, s0, (flush ? n_state : n_row)*sizeof(float));
+            if (flush) {
+                memset(s + n_state, 0, (n_row - n_state)*sizeof(float));
+            } else {
+                s[n_row - 1] = count + 1;
+            }
+        }
+        ggml_barrier(params->threadpool);
+
+        for (int64_t h = params->ith; h < nh; h += params->nth) {
+            const int64_t g = h / (nh / ng);
+            const float A = ((const float *) src_A->data)[h];
+            const float * C = (const float *) ((const char *) src_C->data + seq*src_C->nb[3]) + g*nc;
+            // Decode includes the current token; prefill first flushes only the pending history.
+            const int32_t n_steps = count + (nt == 1);
+            const float * x_steps[32];
+            const float * B_steps[32];
+            float steps[32], scales[32], bc[32];
+            float total_dt = 0.0f;
+            for (int32_t j = 0; j < n_steps; ++j) {
+                const float * record = j < count ? s0 + n_state + j*n_record : nullptr;
+                x_steps[j] = record ? record : (const float *) ((const char *) src_x->data + seq*src_x->nb[3]);
+                B_steps[j] = record ? record + ni + nh + g*nc : (const float *) ((const char *) src_B->data + seq*src_B->nb[3]) + g*nc;
+                steps[j] = record ? record[ni + h] : ggml_compute_softplus_f32(((const float *) ((const char *) src_dt->data + seq*src_dt->nb[2]))[h]);
+                total_dt += steps[j];
+            }
+            const float total_decay = expf(A*total_dt);
+            float prefix_dt = 0.0f;
+            for (int32_t j = 0; j < n_steps; ++j) {
+                prefix_dt += steps[j];
+                scales[j] = j == n_steps - 1 ? steps[j] : steps[j]*expf(A*(total_dt - prefix_dt));
+                if (!flush) {
+                    bc[j] = 0.0f;
+                    for (int64_t n = 0; n < nc; ++n) {
+                        bc[j] += B_steps[j][n]*C[n];
+                    }
+                }
+            }
+            for (int64_t m = 0; m < nr; ++m) {
+                float sum = 0.0f;
+                for (int64_t n = 0; n < nc; ++n) {
+                    const int64_t i = (h*nr + m)*nc + n;
+                    if (flush && n_steps > 0) {
+                        float delta = 0.0f;
+                        for (int32_t j = 0; j < n_steps; ++j) {
+                            delta += x_steps[j][h*nr + m]*(B_steps[j][n]*scales[j]);
+                        }
+                        s[i] = s0[i]*total_decay + delta;
+                    }
+                    if (nt == 1) {
+                        sum += (flush ? s[i] : s0[i])*C[n];
+                    }
+                }
+                if (!flush) {
+                    float delta = 0.0f;
+                    for (int32_t j = 0; j < n_steps; ++j) {
+                        delta += x_steps[j][h*nr + m]*(scales[j]*bc[j]);
+                    }
+                    sum = sum*total_decay + delta;
+                }
+                if (nt == 1) {
+                    ((float *) dst->data)[seq*ni + h*nr + m] = sum;
+                }
+            }
+            if (!flush) {
+                float * next = s + n_state + count*n_record;
+                memcpy(next + h*nr, x_steps[count] + h*nr, nr*sizeof(float));
+                next[ni + h] = steps[count];
+                if (h % (nh / ng) == 0) {
+                    memcpy(next + ni + nh + g*nc, B_steps[count], nc*sizeof(float));
+                }
+            }
+            for (int64_t t = 0; nt > 1 && t < nt; ++t) {
+                const float * x = (const float *) ((const char *) src_x->data + t*src_x->nb[2] + seq*src_x->nb[3]);
+                const float * B = (const float *) ((const char *) src_B->data + t*src_B->nb[2] + seq*src_B->nb[3]) + g*nc;
+                C = (const float *) ((const char *) src_C->data + t*src_C->nb[2] + seq*src_C->nb[3]) + g*nc;
+                const float dt = ggml_compute_softplus_f32(((const float *) ((const char *) src_dt->data + t*src_dt->nb[1] + seq*src_dt->nb[2]))[h]);
+                const float decay = expf(A*dt);
+                for (int64_t m = 0; m < nr; ++m) {
+                    float sum = 0.0f;
+                    const float xdt = x[h*nr + m]*dt;
+                    for (int64_t n = 0; n < nc; ++n) {
+                        const int64_t i = (h*nr + m)*nc + n;
+                        s[i] = s[i]*decay + B[n]*xdt;
+                        sum += s[i]*C[n];
+                    }
+                    ((float *) dst->data)[(seq*nt + t)*ni + h*nr + m] = sum;
+                }
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_win_part
 
 static void ggml_compute_forward_win_part_f32(

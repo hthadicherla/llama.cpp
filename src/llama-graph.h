@@ -308,7 +308,7 @@ public:
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main; // I32 [n_seqs]
-    ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
+    ggml_tensor * s_copy_tail; // I32 [n_rs - 1], or [n_rs - n_seqs] for ReplaySSM execution
 
     const llama_memory_recurrent_context * mctx;
 
