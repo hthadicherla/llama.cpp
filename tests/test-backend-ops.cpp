@@ -4904,6 +4904,8 @@ struct test_ssm_scan_replay : public test_case {
     const int32_t count; // -1 mixes empty, partial and full histories across rows.
     const bool xbc_overlap;
     const bool shared_ids;
+    const bool weak_decay;
+    const bool model_scale;
     ggml_tensor * s;
     ggml_tensor * x;
     ggml_tensor * dt;
@@ -4914,13 +4916,13 @@ struct test_ssm_scan_replay : public test_case {
 
     test_ssm_scan_replay(int32_t window, int64_t d_state, int64_t head_dim, int64_t n_head,
                         int64_t n_group, int64_t n_seq_tokens, int64_t n_seqs, int32_t count,
-                        bool xbc_overlap = false, bool shared_ids = false)
+                        bool xbc_overlap = false, bool shared_ids = false, bool weak_decay = false, bool model_scale = false)
         : window(window), d_state(d_state), head_dim(head_dim), n_head(n_head), n_group(n_group),
           n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), count(count), xbc_overlap(xbc_overlap),
-          shared_ids(shared_ids) {}
+          shared_ids(shared_ids), weak_decay(weak_decay), model_scale(model_scale) {}
 
     std::string vars() override {
-        return VARS_TO_STR10(window, d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, count, xbc_overlap, shared_ids);
+        return VARS_TO_STR11(window, d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, count, xbc_overlap, shared_ids, weak_decay) + "," + VAR_TO_STR(model_scale);
     }
 
     double max_nmse_err() override { return n_seq_tokens > 128 ? 2e-7 : 1e-7; }
@@ -4955,6 +4957,8 @@ struct test_ssm_scan_replay : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(1234);
+        std::normal_distribution<float> normal;
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (t->view_src != nullptr) {
                 continue;
@@ -4969,9 +4973,16 @@ struct test_ssm_scan_replay : public test_case {
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "replay_A") == 0) {
-                init_tensor_uniform(t, -0.1f, -0.01f);
+                init_tensor_uniform(t, model_scale ? -2.0f : weak_decay ? -1e-5f : -0.1f,
+                                       model_scale ? -1.0f : weak_decay ? -1e-6f : -0.01f);
             } else {
-                init_tensor_uniform(t, -0.125f, 0.125f);
+                if (model_scale) {
+                    std::vector<float> data(ggml_nelements(t));
+                    for (float & value : data) { value = normal(gen) - (t == dt ? 4.0f : 0.0f); }
+                    ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+                } else {
+                    init_tensor_uniform(t, -0.125f, 0.125f);
+                }
                 if (strcmp(t->name, "replay_state") == 0) {
                     const int64_t ni = head_dim*n_head;
                     const int64_t n_state  = d_state*ni;
@@ -4983,7 +4994,7 @@ struct test_ssm_scan_replay : public test_case {
                         const int32_t pending = count >= 0 ? count : seq % 3 == 0 ? 0 : seq % 3 == 1 ? window / 2 : window - 1;
                         for (int32_t j = 0; j < pending; ++j) {
                             for (int64_t h = 0; h < n_head; ++h) {
-                                row[n_state + j*n_record + ni + h] = 0.5f + 0.01f*h;
+                                row[n_state + j*n_record + ni + h] = model_scale ? log1pf(expf(normal(gen) - 4.0f)) : 0.5f + 0.01f*h;
                             }
                         }
                         row[t->ne[0] - 1] = pending;
@@ -5036,8 +5047,9 @@ struct test_ssm_scan_replay_coefficient : public test_ssm_scan_replay {
 };
 
 struct test_ssm_scan_replay_sequence : public test_ssm_scan_replay {
-    test_ssm_scan_replay_sequence(int32_t window, int64_t d_state, int64_t n_seqs)
-        : test_ssm_scan_replay(window, d_state, 32, 4, 2, 2*window + 11, n_seqs, 0) {}
+    test_ssm_scan_replay_sequence(int32_t window, int64_t d_state, int64_t n_seqs,
+                                 int64_t n_group = 2, bool xbc_overlap = false, bool weak_decay = false)
+        : test_ssm_scan_replay(window, d_state, 32, 4, n_group, 2*window + 11, n_seqs, 0, xbc_overlap, false, weak_decay) {}
 
     std::string op_desc(ggml_tensor *) override { return "SSM_SCAN_REPLAY_SEQUENCE"; }
     bool run_whole_graph() override { return true; }
@@ -11623,22 +11635,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 128, 2)); // SSD multi-chunk, no tail (exercises the chunk-to-chunk state handoff)
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 128, 2, false, /*K=*/1, /*weak_decay=*/true)); // SSD multi-chunk, carried state not numerically negligible
 
-    for (int32_t window : { 1, 2, 16, 32 }) {
+    for (int32_t window : { 1, 2, 4, 8, 16, 32 }) {
         test_cases.emplace_back(new test_ssm_scan_replay(window, 128, 64, 4, 2, 1, 2, 0));
         if (window > 1) {
             test_cases.emplace_back(new test_ssm_scan_replay(window, 128, 64, 4, 2, 1, 2, window - 1));
         }
+        test_cases.emplace_back(new test_ssm_scan_replay_sequence(window, 128, 2));
     }
-    test_cases.emplace_back(new test_ssm_scan_replay_sequence(16, 128, 2));
     test_cases.emplace_back(new test_ssm_scan_replay(16, 96, 64, 8, 2, 1, 2, 7));
     test_cases.emplace_back(new test_ssm_scan_replay(16, 256, 64, 4, 1, 1, 1, 15));
     test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 32, 4, 2, 5, 2, 7));
     test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 80, 8, 2, 1, 2, 7));
     test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 80, 8, 2, 300, 2, 7));
-    test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 16, 16, 8, 1, 4, -1, true, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_sequence(16, 96, 1));
+    for (int64_t n_group : { 1, 8, 16 }) {
+        test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 16, 16, n_group, 1, 4, -1, true, true));
+    }
+    for (int32_t count : { 7, 15 }) {
+        test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 80, 96, 8, 1, 1, count, true, false, false, true)); // Nano
+        test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 64, 128, 8, 1, 1, count, true, false, false, true)); // Super
+        test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 64, 256, 8, 1, 1, count, true, false, false, true)); // Ultra
+    }
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(1, 0));
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 0));
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 15));
+    test_cases.emplace_back(new test_ssm_scan_replay_sequence(4, 96, 1, 1, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_sequence(8, 256, 4, 4, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_sequence(16, 128, 2, 1, true, true));
     for (int32_t count : { 0, 7, 15 }) {
         test_cases.emplace_back(new test_ssm_scan_replay_cache(count));
     }
@@ -11649,6 +11672,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan_replay_cache(15, false, 1, 64, 4, 2, 2));
     test_cases.emplace_back(new test_ssm_scan_replay_cache(7, false, 300, 64, 4, 2, 2));
     test_cases.emplace_back(new test_ssm_scan_replay_cache(7, false, 1, 64, 4, 2, 3));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(-1, false, 1, 32, 8, 8, 4, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(-1, false, 1, 32, 8, 1, 4, true, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(-1, true, 1, 32, 8, 8, 4, true, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(-1, false, 5, 32, 8, 2, 4, true, true));
 
     // ssm_scan + cache cpy fusion
     test_cases.emplace_back(new test_ssm_scan_cache_fusion(GGML_TYPE_F32, 128, 64, 16, 2, 4, 1, 4));
