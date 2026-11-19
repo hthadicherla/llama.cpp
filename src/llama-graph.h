@@ -311,6 +311,7 @@ public:
 
     // I32 [n_slot] = {n_slot - 1, ..., 0}, rollback slot of each conv window, created by the graphs that write them
     ggml_tensor * s_slot_rev = nullptr;
+    ggml_tensor * s_round_pos = nullptr; // I32 [n_seq_tokens, n_seqs], shared across SSM layers
 
     const llama_memory_recurrent_context * mctx;
 
