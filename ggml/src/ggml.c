@@ -1115,10 +1115,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
-    "SSM_SCAN_REPLAY",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1232,10 +1231,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
-    "ssm_scan_replay(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5918,7 +5916,7 @@ struct ggml_tensor * ggml_ssm_scan_replay(
     GGML_ASSERT((uint64_t) n_output <= (SIZE_MAX - GGML_MEM_ALIGN) / sizeof(float));
 
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_output);
-    result->op     = GGML_OP_SSM_SCAN_REPLAY;
+    result->op     = GGML_OP_SSM_SCAN;
     result->src[0] = s;
     result->src[1] = x;
     result->src[2] = dt;
@@ -5926,7 +5924,8 @@ struct ggml_tensor * ggml_ssm_scan_replay(
     result->src[4] = B;
     result->src[5] = C;
     result->src[6] = ids;
-    ggml_set_op_params_i32(result, 0, window);
+    ggml_set_op_params_i32(result, 0, 1); // one updated state row per sequence
+    ggml_set_op_params_i32(result, 1, window);
     return result;
 }
 
