@@ -6248,6 +6248,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
                    (op->type         == GGML_TYPE_F32 || op->type         == GGML_TYPE_F16);
         case GGML_OP_SSM_SCAN: {
+            if (ggml_get_op_params_i32(op, 1) != 0) {
+                return false;
+            }
             const int32_t K = ggml_get_op_params_i32(op, 0);
 
             if (op->src[3]->ne[0] == 1) {

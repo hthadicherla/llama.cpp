@@ -10233,22 +10233,7 @@ static void ggml_compute_forward_ssm_scan_f32(
     }
 }
 
-void ggml_compute_forward_ssm_scan(
-        const ggml_compute_params * params,
-        ggml_tensor * dst) {
-    switch (dst->src[0]->type) {
-        case GGML_TYPE_F32:
-            {
-                ggml_compute_forward_ssm_scan_f32(params, dst);
-            } break;
-        default:
-            {
-                GGML_ABORT("fatal error");
-            }
-    }
-}
-
-void ggml_compute_forward_ssm_scan_replay(
+static void ggml_compute_forward_ssm_scan_replay(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     const ggml_tensor * src_s  = dst->src[0];
@@ -10269,7 +10254,7 @@ void ggml_compute_forward_ssm_scan_replay(
     const int64_t n_state  = nc*ni;
     const int64_t n_record = ni + nh + nc*ng;
     const int64_t n_row    = src_s->ne[0];
-    const int32_t window  = ggml_get_op_params_i32(dst, 0);
+    const int32_t window  = ggml_get_op_params_i32(dst, 1);
 
     GGML_ASSERT(window >= 1 && window <= 32);
     for (int i = 0; i < 6; ++i) {
@@ -10379,6 +10364,25 @@ void ggml_compute_forward_ssm_scan_replay(
                 }
             }
         }
+    }
+}
+
+void ggml_compute_forward_ssm_scan(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                if (ggml_get_op_params_i32(dst, 1) != 0) {
+                    ggml_compute_forward_ssm_scan_replay(params, dst);
+                } else {
+                    ggml_compute_forward_ssm_scan_f32(params, dst);
+                }
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
     }
 }
 
