@@ -880,15 +880,6 @@ static void ggml_cuda_op_ssm_scan_impl(ggml_backend_cuda_context & ctx, ggml_ten
                       s_off, nc, nr, nh, ng, n_t, n_s, K, cache, stream);
 }
 
-void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_op_ssm_scan_impl(ctx, dst, nullptr);
-}
-
-void ggml_cuda_op_ssm_scan_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
-                                       ggml_cuda_ssm_scan_fused_cache cache) {
-    ggml_cuda_op_ssm_scan_impl(ctx, dst, &cache);
-}
-
 struct ssm_replay_params {
     int64_t d_state, head_dim, n_head, n_group, window, row, slots;
     int64_t s_stride, x_head, x_seq, dt_seq, A_head, B_group, B_seq, C_group, C_seq;
@@ -1096,8 +1087,8 @@ static __global__ void ssm_replay_commit(
     }
 }
 
-void ggml_cuda_op_ssm_scan_replay(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
-                                const ggml_cuda_ssm_scan_fused_cache * cache) {
+static void ggml_cuda_op_ssm_scan_replay(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                        const ggml_cuda_ssm_scan_fused_cache * cache) {
     const ggml_tensor * s   = dst->src[0];
     const ggml_tensor * x   = dst->src[1];
     const ggml_tensor * dt  = dst->src[2];
@@ -1110,7 +1101,7 @@ void ggml_cuda_op_ssm_scan_replay(ggml_backend_cuda_context & ctx, ggml_tensor *
     const int64_t D = B->ne[0] * x->ne[0] * x->ne[1];
     const int64_t n_y = ggml_nelements(x);
     const ssm_replay_params p = {
-        B->ne[0], x->ne[0], x->ne[1], B->ne[1], ggml_get_op_params_i32(dst, 0), s->ne[0], s->ne[1],
+        B->ne[0], x->ne[0], x->ne[1], B->ne[1], ggml_get_op_params_i32(dst, 1), s->ne[0], s->ne[1],
         (int64_t) (s->nb[1] / sizeof(float)), (int64_t) (x->nb[1] / sizeof(float)), (int64_t) (x->nb[3] / sizeof(float)),
         (int64_t) (dt->nb[2] / sizeof(float)), (int64_t) (A->nb[1] / sizeof(float)),
         (int64_t) (B->nb[1] / sizeof(float)), (int64_t) (B->nb[3] / sizeof(float)),
@@ -1179,12 +1170,11 @@ void ggml_cuda_op_ssm_scan_replay(ggml_backend_cuda_context & ctx, ggml_tensor *
     ggml_tensor identity = *ids;
     identity.data = metadata.get();
     ggml_tensor scan = *dst;
-    scan.op = GGML_OP_SSM_SCAN;
     scan.src[0] = &state;
     scan.src[6] = &identity;
     scan.ne[0] = n_y + D * n_seq;
     scan.nb[1] = scan.nb[2] = scan.nb[3] = scan.ne[0] * sizeof(float);
-    ggml_set_op_params_i32(&scan, 0, 1);
+    ggml_set_op_params_i32(&scan, 1, 0);
     ggml_cuda_pool_alloc<float> scan_buf(ctx.pool());
     if (n_seq > 1) {
         scan_buf.alloc(scan.ne[0]);
@@ -1197,4 +1187,13 @@ void ggml_cuda_op_ssm_scan_replay(ggml_backend_cuda_context & ctx, ggml_tensor *
                                    D * sizeof(float), n_seq, cudaMemcpyDeviceToDevice, stream));
     }
     CUDA_CHECK(cudaMemset2DAsync(out + D, p.row * sizeof(float), 0, (p.row - D) * sizeof(float), n_seq, stream));
+}
+
+void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                           const ggml_cuda_ssm_scan_fused_cache * cache) {
+    if (ggml_get_op_params_i32(dst, 1) != 0) {
+        ggml_cuda_op_ssm_scan_replay(ctx, dst, cache);
+    } else {
+        ggml_cuda_op_ssm_scan_impl(ctx, dst, cache);
+    }
 }

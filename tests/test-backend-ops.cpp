@@ -4862,6 +4862,7 @@ struct test_ssm_scan : public test_case {
         }
         ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,  n_seqs);
         ggml_tensor * out = ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids, K);
+        GGML_ASSERT(out->op == GGML_OP_SSM_SCAN && out->op_params[0] == K && out->op_params[1] == 0);
         return out;
     }
 
@@ -4953,7 +4954,9 @@ struct test_ssm_scan_replay : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         build_inputs(ctx);
-        return ggml_ssm_scan_replay(ctx, s, x, dt, A, B, C, ids, window);
+        ggml_tensor * out = ggml_ssm_scan_replay(ctx, s, x, dt, A, B, C, ids, window);
+        GGML_ASSERT(out->op == GGML_OP_SSM_SCAN && out->op_params[0] == 1 && out->op_params[1] == window);
+        return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {

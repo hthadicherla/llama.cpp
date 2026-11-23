@@ -605,7 +605,6 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
-        GGML_OP_SSM_SCAN_REPLAY,
 
         GGML_OP_COUNT,
     };
@@ -2579,7 +2578,7 @@ extern "C" {
             struct ggml_tensor  * ids,
             int64_t               K);
 
-    // Mamba-2 scan with an F32 checkpoint and a replay window, 1 <= window <= 32.
+    // SSM_SCAN with an F32 Mamba-2 checkpoint and a replay window, 1 <= window <= 32.
     // Each row of s contains the checkpoint, window records [x, softplus(dt), B], and a record count.
     // Returns contiguous x-shaped outputs followed by the updated packed rows selected by ids.
     // Multi-token calls materialize pending inputs and clear the replay window. No rollback snapshots are returned.
