@@ -1126,23 +1126,13 @@ static void ggml_cuda_op_ssm_scan_replay(ggml_backend_cuda_context & ctx, ggml_t
         CUDA_CHECK(cudaGetLastError());
     }
     const dim3 blocks(p.n_head * ((p.head_dim + threads / WARP_SIZE - 1) / (threads / WARP_SIZE)), n_seq);
-    if (p.d_state == 96) {
-        ssm_replay_scan<96><<<blocks, threads, 0, stream>>>(
-            (const float *) s->data, (const float *) x->data, (const float *) dt->data, (const float *) A->data,
-            (const float *) B->data, (const float *) C->data, (const int32_t *) ids->data, bc_buf.get(),
-            (float *) dst->data, staged, cache ? cache->data : nullptr, metadata.get(), p, materialize);
-    } else if (p.d_state == 128) {
-        ssm_replay_scan<128><<<blocks, threads, 0, stream>>>(
-            (const float *) s->data, (const float *) x->data, (const float *) dt->data, (const float *) A->data,
-            (const float *) B->data, (const float *) C->data, (const int32_t *) ids->data, bc_buf.get(),
-            (float *) dst->data, staged, cache ? cache->data : nullptr, metadata.get(), p, materialize);
-    } else {
-        GGML_ASSERT(p.d_state == 256);
-        ssm_replay_scan<256><<<blocks, threads, 0, stream>>>(
-            (const float *) s->data, (const float *) x->data, (const float *) dt->data, (const float *) A->data,
-            (const float *) B->data, (const float *) C->data, (const int32_t *) ids->data, bc_buf.get(),
-            (float *) dst->data, staged, cache ? cache->data : nullptr, metadata.get(), p, materialize);
-    }
+    GGML_ASSERT(p.d_state == 96 || p.d_state == 128 || p.d_state == 256);
+    const auto kernel = p.d_state == 96  ? ssm_replay_scan<96>  :
+                        p.d_state == 128 ? ssm_replay_scan<128> : ssm_replay_scan<256>;
+    kernel<<<blocks, threads, 0, stream>>>(
+        (const float *) s->data, (const float *) x->data, (const float *) dt->data, (const float *) A->data,
+        (const float *) B->data, (const float *) C->data, (const int32_t *) ids->data, bc_buf.get(),
+        (float *) dst->data, staged, cache ? cache->data : nullptr, metadata.get(), p, materialize);
     CUDA_CHECK(cudaGetLastError());
     if (n_tok == 1) {
         ssm_replay_store<<<dim3(128, n_seq), 256, 0, stream>>>(

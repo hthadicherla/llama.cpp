@@ -244,12 +244,7 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         auto get_ssm_rows = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
             if (states->ne[0] != hparams.n_embd_s()) {
                 GGML_ASSERT(K == 1);
-                const int64_t n_record = d_inner + n_head + d_state*n_group;
-                const int64_t n_history = states->ne[0] - d_state*d_inner - 1;
-                GGML_ASSERT(n_history > 0 && n_history % n_record == 0);
-                const int64_t window = n_history / n_record;
-                GGML_ASSERT(window >= 1 && window <= 32);
-                return ggml_ssm_scan_replay(ctx, states, x, dt, A, B, C, ids, (int32_t) window);
+                return ggml_ssm_scan_replay(ctx, states, x, dt, A, B, C, ids, cparams.ssm_replay_window);
             }
             ggml_tensor * ssm = ggml_reshape_4d(ctx, states, d_state, head_dim, n_head, state_slots);
 
