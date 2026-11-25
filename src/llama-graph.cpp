@@ -4146,7 +4146,7 @@ ggml_tensor * llm_graph_context::build_rs(
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
-    // one gather of the states i0..n_rs (ubatch states then extra states), sized by n_rs so the reserve covers every split
+    // one gather of the states i0..n_rs: the ubatch states then the extra states, or only the extra states with a custom getter (i0 = n_seqs, i0 = 1 in the reserve)
     // {state_size, rs_size} -> {state_size, n_rs - i0}
     const int64_t i0 = n_rs - state_copy->ne[0];
 
@@ -4178,23 +4178,14 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     const int64_t n_rs   = mctx_cur->get_n_rs();
     const int64_t n_seqs = ubatch.n_seqs;
-    int64_t n_skip = 1;
-    if (cparams.ssm_replay_window > 0 && n_seqs > 1 && !mctx_cur->get_is_full()) {
-        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
-            const auto * s = mctx_cur->get_s_l(il);
-            if (s && s->ne[0] != hparams.n_embd_s()) {
-                n_skip = n_seqs;
-                break;
-            }
-        }
-    }
+    // the reserve keeps the worst case: a single sequence ubatch
+    const int64_t n_skip = mctx_cur->get_is_full() ? 1 : n_seqs;
 
     inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
     ggml_set_input(inp->s_copy);
     ggml_set_name(inp->s_copy, "rs_s_copy");
 
     inp->s_copy_main = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
-    // Reserve the worst-case gather; ReplaySSM execution only gathers inactive rows.
     inp->s_copy_tail = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_skip, n_skip * inp->s_copy->nb[0]);
 
     inp->head = mctx_cur->get_head();
@@ -4244,7 +4235,7 @@ ggml_tensor * llm_graph_context::build_rs(
         const llm_graph_get_rows_fn & get_state_rows) const {
     const auto * kv_state = inp->mctx;
 
-    // A custom getter reads active states directly. The gather retains the extra rows and the reserve capacity.
+    // a custom getter reads the states of the ubatch straight from the cache, so the gather only holds the n_rs - n_seqs extra states
     ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
 
     return build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
