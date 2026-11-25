@@ -1006,15 +1006,6 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
     io.write(&s_trans, sizeof(s_trans));
     io.write(&n_layer, sizeof(n_layer));
 
-    // cell_ranges already selects the current rows, including rollback snapshots.
-    const auto write_rows = [&](ggml_tensor * t) {
-        const uint64_t size_row = t->nb[1];
-        io.write(&size_row, sizeof(size_row));
-        for (const auto & range : cell_ranges) {
-            io.write_tensor(t, range.first * size_row, (range.second - range.first) * size_row);
-        }
-    };
-
     // Iterate and write all the R tensors first, each row is a cell
     // Get whole range at a time
     for (uint32_t il = 0; il < n_layer; ++il) {
@@ -1025,11 +1016,27 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         const int32_t r_type_i = (int32_t)r_l[il]->type;
         io.write(&r_type_i, sizeof(r_type_i));
 
-        write_rows(r_l[il]);
+        // Write row size of R tensor
+        const uint64_t r_size_row = r_l[il]->nb[1];
+        io.write(&r_size_row, sizeof(r_size_row));
+
+        // Write each logical cell row range. With pending recurrent rollback,
+        // the logical current state may live in a rollback snapshot plane.
+        for (const auto & range : cell_ranges) {
+            const size_t range_size = range.second - range.first;
+            const size_t buf_size = range_size * r_size_row;
+            io.write_tensor(r_l[il], range.first * r_size_row, buf_size);
+        }
 
         // the PLE conv history is a second recurrent row, so it has to travel with the first
         if (p_l[il] != nullptr) {
-            write_rows(p_l[il]);
+            const uint64_t p_size_row = p_l[il]->nb[1];
+            io.write(&p_size_row, sizeof(p_size_row));
+
+            for (const auto & range : cell_ranges) {
+                const size_t range_size = range.second - range.first;
+                io.write_tensor(p_l[il], range.first * p_size_row, range_size * p_size_row);
+            }
         }
     }
 
@@ -1042,7 +1049,17 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             const int32_t s_type_i = (int32_t)s_l[il]->type;
             io.write(&s_type_i, sizeof(s_type_i));
 
-            write_rows(s_l[il]);
+            // Write row size of S tensor
+            const uint64_t s_size_row = s_l[il]->nb[1];
+            io.write(&s_size_row, sizeof(s_size_row));
+
+            // Write each logical cell row range. With pending recurrent rollback,
+            // the logical current state may live in a rollback snapshot plane.
+            for (const auto & range : cell_ranges) {
+                const size_t range_size = range.second - range.first;
+                const size_t buf_size = range_size * s_size_row;
+                io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+            }
         }
     } else {
         // When S tensor is transposed, we also need the element size and get the element ranges from each row
@@ -1082,7 +1099,12 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             for (ggml_tensor * t : { spk_l[il], spv_l[il], spgb_l[il] }) {
                 if (t == nullptr) continue;
 
-                write_rows(t);
+                const uint64_t size_row = t->nb[1];
+                io.write(&size_row, sizeof(size_row));
+
+                for (const auto & range : cell_ranges) {
+                    io.write_tensor(t, range.first * size_row, (range.second - range.first) * size_row);
+                }
             }
         }
     }

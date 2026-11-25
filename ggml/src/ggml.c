@@ -5770,26 +5770,16 @@ struct ggml_tensor * ggml_ssm_scan_replay(
     GGML_ASSERT(d_state > 0 && n_group > 0 && n_head > 0 && x->ne[0] > 0);
     GGML_ASSERT(x->ne[2] > 0 && x->ne[3] > 0 && s->ne[1] > 0);
     GGML_ASSERT(n_head % n_group == 0);
-    GGML_ASSERT(x->ne[0] <= INT64_MAX / n_head);
-    const int64_t d_inner = x->ne[0]*n_head;
-    GGML_ASSERT(d_state <= INT64_MAX / d_inner);
-    GGML_ASSERT(d_state <= (INT64_MAX - d_inner - n_head) / n_group);
+    const int64_t d_inner  = x->ne[0]*n_head;
     const int64_t n_state  = d_state*d_inner;
     const int64_t n_record = d_inner + n_head + d_state*n_group;
-    GGML_ASSERT(n_record <= (INT64_MAX - n_state - 1) / window);
     GGML_ASSERT(s->ne[0] == n_state + window*n_record + 1);
     GGML_ASSERT(dt->ne[0] == n_head && dt->ne[1] == x->ne[2] && dt->ne[2] == x->ne[3]);
     GGML_ASSERT(A->ne[0] == 1 && A->ne[1] == n_head);
     GGML_ASSERT(B->ne[2] == x->ne[2] && B->ne[3] == x->ne[3]);
     GGML_ASSERT(ids->ne[0] == x->ne[3]);
-    GGML_ASSERT(x->ne[2] <= INT64_MAX / d_inner);
-    GGML_ASSERT(x->ne[3] <= INT64_MAX / (d_inner*x->ne[2]));
-    const int64_t n_y = d_inner*x->ne[2]*x->ne[3];
-    GGML_ASSERT(s->ne[0] <= (INT64_MAX - n_y) / ids->ne[0]);
-    const int64_t n_output = n_y + s->ne[0]*ids->ne[0];
-    GGML_ASSERT((uint64_t) n_output <= (SIZE_MAX - GGML_MEM_ALIGN) / sizeof(float));
 
-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_output);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(x) + s->ne[0]*ids->ne[0]);
     result->op     = GGML_OP_SSM_SCAN;
     result->src[0] = s;
     result->src[1] = x;
