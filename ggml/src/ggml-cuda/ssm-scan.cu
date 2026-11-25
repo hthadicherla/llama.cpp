@@ -795,8 +795,16 @@ static void ssm_scan_ssd_f32_cuda(
 }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
+static void ggml_cuda_op_ssm_scan_replay(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                         const ggml_cuda_ssm_scan_fused_cache * cache);
+
 static void ggml_cuda_op_ssm_scan_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                        const ggml_cuda_ssm_scan_fused_cache * cache) {
+    if (ggml_get_op_params_i32(dst, 1) != 0) {
+        ggml_cuda_op_ssm_scan_replay(ctx, dst, cache);
+        return;
+    }
+
     const struct ggml_tensor * src0 = dst->src[0];  // s
     const struct ggml_tensor * src1 = dst->src[1];  // x
     const struct ggml_tensor * src2 = dst->src[2];  // dt
@@ -969,7 +977,7 @@ static __global__ void ssm_replay_scan(
     const float * k = B + seq * p.B_seq + group * p.B_group;
     const float * v = x + seq * p.x_seq + head * p.x_head;
 
-    __shared__ float scale[32];
+    __shared__ float scale[WARP_SIZE];
     __shared__ float total_decay;
     if (warp == 0) {
         // lane l holds step n_steps - 1 - l: the sum of the lanes below it is the dt after that step (total - prefix loses it when |A| is large)
@@ -1051,17 +1059,19 @@ static __global__ void ssm_replay_scan(
 // Update history after every head has finished reading the previous count and records.
 static __global__ void ssm_replay_store(
         const float * s, const float * x, const float * dt, const float * B, const int32_t * ids, const int32_t * counts,
-        float * out, const ssm_replay_params p) {
+        float * staged, float * out, const ssm_replay_params p) {
     const int seq = blockIdx.y;
     const int64_t inner = p.head_dim * p.n_head;
     const int64_t D = p.d_state * inner;
     const int64_t record = inner + p.n_head + p.d_state * p.n_group;
     const float * src = s + ids[seq] * p.s_stride;
-    float * dst = out + seq * p.row;
     const int count = counts[seq];
     const bool flush = count + 1 == p.window;
-    const int64_t begin = src == dst && !flush ? count * record : 0;
-    const int64_t end = src == dst && !flush ? (count + 1) * record : p.window * record;
+    // a row that stays in place only gains one record, and no other sequence reads that record: write it unstaged
+    const bool append = !flush && src == out + seq * p.row;
+    float * dst = (append ? out : staged) + seq * p.row;
+    const int64_t begin = append ? count * record : 0;
+    const int64_t end = append ? (count + 1) * record : p.window * record;
     for (int64_t i = begin + blockIdx.x * blockDim.x + threadIdx.x; i < end; i += blockDim.x * gridDim.x) {
         if (flush) {
             dst[D + i] = 0.0f;
@@ -1085,15 +1095,16 @@ static __global__ void ssm_replay_store(
     }
 }
 
-// All source rows have been read before committing a batch that can move or share cache rows.
+// Flushed or moved rows stay staged until every source row has been read; the other rows were appended by ssm_replay_store.
 static __global__ void ssm_replay_commit(
-        const float * staged, const float * s, const int32_t * ids, float * cache, const ssm_replay_params p) {
+        const float * staged, const float * s, const int32_t * ids, const int32_t * counts, float * cache, const ssm_replay_params p) {
     const int seq = blockIdx.y;
     const float * src = staged + seq * p.row;
     float * dst = cache + seq * p.row;
-    const bool copy_state = src[p.row - 1] == 0.0f || s + ids[seq] * p.s_stride != dst;
-    const int64_t begin = copy_state ? 0 : p.d_state * p.head_dim * p.n_head;
-    for (int64_t i = begin + blockIdx.x * blockDim.x + threadIdx.x; i < p.row; i += blockDim.x * gridDim.x) {
+    if (counts[seq] + 1 != p.window && s + ids[seq] * p.s_stride == dst) {
+        return;
+    }
+    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < p.row; i += blockDim.x * gridDim.x) {
         dst[i] = src[i];
     }
 }
@@ -1125,7 +1136,7 @@ static void ggml_cuda_op_ssm_scan_replay(ggml_backend_cuda_context & ctx, ggml_t
     ggml_cuda_pool_alloc<int32_t> metadata(ctx.pool(), n_seq); // pending counts or materialized row ids
     ggml_cuda_pool_alloc<float> bc_buf(ctx.pool());
     ggml_cuda_pool_alloc<float> state_buf(ctx.pool());
-    const int threads = 4 * ggml_cuda_info().devices[ctx.device].warp_size;
+    const int threads = 4 * WARP_SIZE;
     float * staged = cache && n_seq > 1 ? (float *) dst->data + n_y : out;
     if (materialize) {
         staged = state_buf.alloc(D * n_seq);
@@ -1148,11 +1159,11 @@ static void ggml_cuda_op_ssm_scan_replay(ggml_backend_cuda_context & ctx, ggml_t
     if (n_tok == 1) {
         ssm_replay_store<<<dim3(128, n_seq), 256, 0, stream>>>(
             (const float *) s->data, (const float *) x->data, (const float *) dt->data,
-            (const float *) B->data, (const int32_t *) ids->data, metadata.get(), staged, p);
+            (const float *) B->data, (const int32_t *) ids->data, metadata.get(), staged, out, p);
         CUDA_CHECK(cudaGetLastError());
         if (staged != out) {
             ssm_replay_commit<<<dim3(128, n_seq), 256, 0, stream>>>(
-                staged, (const float *) s->data, (const int32_t *) ids->data, out, p);
+                staged, (const float *) s->data, (const int32_t *) ids->data, metadata.get(), out, p);
             CUDA_CHECK(cudaGetLastError());
         }
         return;
@@ -1176,25 +1187,21 @@ static void ggml_cuda_op_ssm_scan_replay(ggml_backend_cuda_context & ctx, ggml_t
     scan.ne[0] = n_y + D * n_seq;
     scan.nb[1] = scan.nb[2] = scan.nb[3] = scan.ne[0] * sizeof(float);
     ggml_set_op_params_i32(&scan, 1, 0);
-    ggml_cuda_pool_alloc<float> scan_buf(ctx.pool());
-    if (n_seq > 1) {
-        scan_buf.alloc(scan.ne[0]);
-        scan.data = scan_buf.get();
+    // identity ids: each sequence updates its own materialized state in place
+    const ggml_cuda_ssm_scan_fused_cache dense = { state_buf.get(), 0 };
+    ggml_cuda_op_ssm_scan_impl(ctx, &scan, &dense);
+    CUDA_CHECK(cudaMemcpy2DAsync(out, p.row * sizeof(float), state_buf.get(), D * sizeof(float),
+                               D * sizeof(float), n_seq, cudaMemcpyDeviceToDevice, stream));
+    for (int64_t i = 0; i < n_seq; ++i) {
+        CUDA_CHECK(cudaMemsetAsync(out + i * p.row + D, 0, (p.row - D) * sizeof(float), stream));
     }
-    ggml_cuda_op_ssm_scan_impl(ctx, &scan, n_seq == 1 ? cache : nullptr);
-    if (n_seq > 1) {
-        CUDA_CHECK(cudaMemcpyAsync(dst->data, scan.data, n_y * sizeof(float), cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpy2DAsync(out, p.row * sizeof(float), scan_buf.get() + n_y, D * sizeof(float),
-                                   D * sizeof(float), n_seq, cudaMemcpyDeviceToDevice, stream));
-    }
-    CUDA_CHECK(cudaMemset2DAsync(out + D, p.row * sizeof(float), 0, (p.row - D) * sizeof(float), n_seq, stream));
 }
 
-void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
-                           const ggml_cuda_ssm_scan_fused_cache * cache) {
-    if (ggml_get_op_params_i32(dst, 1) != 0) {
-        ggml_cuda_op_ssm_scan_replay(ctx, dst, cache);
-    } else {
-        ggml_cuda_op_ssm_scan_impl(ctx, dst, cache);
-    }
+void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_op_ssm_scan_impl(ctx, dst, nullptr);
+}
+
+void ggml_cuda_op_ssm_scan_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                       ggml_cuda_ssm_scan_fused_cache cache) {
+    ggml_cuda_op_ssm_scan_impl(ctx, dst, &cache);
 }
