@@ -10427,19 +10427,17 @@ static void ggml_compute_forward_ssm_scan_replay(
             const float * x_steps[32];
             const float * B_steps[32];
             float steps[32], scales[32], bc[32];
-            float total_dt = 0.0f;
             for (int32_t j = 0; j < n_steps; ++j) {
                 const float * record = j < count ? s0 + n_state + j*n_record : nullptr;
                 x_steps[j] = record ? record : (const float *) ((const char *) src_x->data + seq*src_x->nb[3]);
                 B_steps[j] = record ? record + ni + nh + g*nc : (const float *) ((const char *) src_B->data + seq*src_B->nb[3]) + g*nc;
                 steps[j] = record ? record[ni + h] : ggml_compute_softplus_f32(((const float *) ((const char *) src_dt->data + seq*src_dt->nb[2]))[h]);
-                total_dt += steps[j];
             }
-            const float total_decay = expf(A*total_dt);
-            float prefix_dt = 0.0f;
-            for (int32_t j = 0; j < n_steps; ++j) {
-                prefix_dt += steps[j];
-                scales[j] = j == n_steps - 1 ? steps[j] : steps[j]*expf(A*(total_dt - prefix_dt));
+            // sum the dt after each step from the newest: total - prefix loses the small terms when |A| is large
+            float suffix_dt = 0.0f;
+            for (int32_t j = n_steps - 1; j >= 0; --j) {
+                scales[j] = steps[j]*expf(A*suffix_dt);
+                suffix_dt += steps[j];
                 if (!flush) {
                     bc[j] = 0.0f;
                     for (int64_t n = 0; n < nc; ++n) {
@@ -10447,6 +10445,7 @@ static void ggml_compute_forward_ssm_scan_replay(
                     }
                 }
             }
+            const float total_decay = expf(A*suffix_dt);
             for (int64_t m = 0; m < nr; ++m) {
                 float sum = 0.0f;
                 for (int64_t n = 0; n < nc; ++n) {

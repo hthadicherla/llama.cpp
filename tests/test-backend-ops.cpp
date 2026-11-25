@@ -5253,18 +5253,36 @@ struct test_ssm_scan_replay_coefficient : public test_ssm_scan_replay {
 
     void initialize_tensors(ggml_context * ctx) override {
         test_ssm_scan_replay::initialize_tensors(ctx);
-        // Captured model values exposed cancellation in A*total - A*prefix:
-        // the current token's decay is exactly one, even for large |A*dt|.
-        init_tensor_uniform(A, -52838.74609375f, -52838.74609375f);
-        init_tensor_uniform(dt, raw_dt, raw_dt);
+        // captured model values: |A| is large, so a record only counts when the dt after it are tiny
+        const float  A_head  = -52838.74609375f;
+        const float  raw_cur = count > 0 ? -14.0f : raw_dt;
+        const double dt_rec  = std::log1p(std::exp((double) raw_dt));
+        const double dt_cur  = std::log1p(std::exp((double) raw_cur));
+        init_tensor_uniform(A, A_head, A_head);
+        init_tensor_uniform(dt, raw_cur, raw_cur);
         init_tensor_uniform(x, 1.0f, 1.0f);
         init_tensor_uniform(B, 1.0f, 1.0f);
         init_tensor_uniform(C, 1.0f/d_state, 1.0f/d_state);
+        const int64_t ni = head_dim*n_head;
+        const int64_t n_record = ni + n_head + d_state*n_group;
+        // the last three records are tiny as well, so the record before them still counts
+        const auto dt_step = [&](int32_t j) { return j == count || (j > 0 && j >= count - 3) ? dt_cur : dt_rec; };
         std::vector<float> state(ggml_nelements(s), 0.0f);
+        for (int32_t j = 0; j < count; ++j) {
+            float * record = state.data() + d_state*ni + j*n_record;
+            std::fill(record, record + n_record, 1.0f); // x and B
+            std::fill(record + ni, record + ni + n_head, (float) dt_step(j));
+        }
         state.back() = count;
         ggml_backend_tensor_set(s, state.data(), 0, ggml_nbytes(s));
-        const float value = (float) std::log1p(std::exp((double) raw_dt));
-        init_tensor_uniform(expected, value, value);
+        // every step, scaled by the decay over the dt after it
+        double value = 0.0;
+        double after = 0.0;
+        for (int32_t j = count; j >= 0; --j) {
+            value += dt_step(j)*std::exp(A_head*after);
+            after += dt_step(j);
+        }
+        init_tensor_uniform(expected, (float) value, (float) value);
     }
 };
 
@@ -12559,6 +12577,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 16, 16, 8, 1, 4, -1, true, true));
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(1, 0));
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 0));
+    test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 1));
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 15));
 
     // ssm_scan + cache cpy fusion
