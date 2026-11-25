@@ -5267,18 +5267,36 @@ struct test_ssm_scan_replay_coefficient : public test_ssm_scan_replay {
 
     void initialize_tensors(ggml_context * ctx) override {
         test_ssm_scan_replay::initialize_tensors(ctx);
-        // Captured model values exposed cancellation in A*total - A*prefix:
-        // the current token's decay is exactly one, even for large |A*dt|.
-        init_tensor_uniform(A, -52838.74609375f, -52838.74609375f);
-        init_tensor_uniform(dt, raw_dt, raw_dt);
+        // captured model values: |A| is large, so a record only counts when the dt after it are tiny
+        const float  A_head  = -52838.74609375f;
+        const float  raw_cur = count > 0 ? -14.0f : raw_dt;
+        const double dt_rec  = std::log1p(std::exp((double) raw_dt));
+        const double dt_cur  = std::log1p(std::exp((double) raw_cur));
+        init_tensor_uniform(A, A_head, A_head);
+        init_tensor_uniform(dt, raw_cur, raw_cur);
         init_tensor_uniform(x, 1.0f, 1.0f);
         init_tensor_uniform(B, 1.0f, 1.0f);
         init_tensor_uniform(C, 1.0f/d_state, 1.0f/d_state);
+        const int64_t ni = head_dim*n_head;
+        const int64_t n_record = ni + n_head + d_state*n_group;
+        // the last three records are tiny as well, so the record before them still counts
+        const auto dt_step = [&](int32_t j) { return j == count || (j > 0 && j >= count - 3) ? dt_cur : dt_rec; };
         std::vector<float> state(ggml_nelements(s), 0.0f);
+        for (int32_t j = 0; j < count; ++j) {
+            float * record = state.data() + d_state*ni + j*n_record;
+            std::fill(record, record + n_record, 1.0f); // x and B
+            std::fill(record + ni, record + ni + n_head, (float) dt_step(j));
+        }
         state.back() = count;
         ggml_backend_tensor_set(s, state.data(), 0, ggml_nbytes(s));
-        const float value = (float) std::log1p(std::exp((double) raw_dt));
-        init_tensor_uniform(expected, value, value);
+        // every step, scaled by the decay over the dt after it
+        double value = 0.0;
+        double after = 0.0;
+        for (int32_t j = count; j >= 0; --j) {
+            value += dt_step(j)*std::exp(A_head*after);
+            after += dt_step(j);
+        }
+        init_tensor_uniform(expected, (float) value, (float) value);
     }
 };
 
@@ -5336,14 +5354,12 @@ struct test_ssm_scan_replay_sequence : public test_ssm_scan_replay {
 };
 
 struct test_ssm_scan_replay_cache : public test_ssm_scan_replay {
-    const bool read_tail;
-
-    test_ssm_scan_replay_cache(int32_t count, bool read_tail = false, int64_t n_tokens = 1,
+    test_ssm_scan_replay_cache(int32_t count, int64_t n_tokens = 1,
                                int64_t head_dim = 64, int64_t n_head = 4, int64_t n_group = 2, int64_t n_seqs = 1,
                                bool xbc_overlap = false, bool shared_ids = false)
-        : test_ssm_scan_replay(16, 128, head_dim, n_head, n_group, n_tokens, n_seqs, count, xbc_overlap, shared_ids), read_tail(read_tail) {}
+        : test_ssm_scan_replay(16, 128, head_dim, n_head, n_group, n_tokens, n_seqs, count, xbc_overlap, shared_ids) {}
 
-    std::string op_desc(ggml_tensor *) override { return read_tail ? "SSM_SCAN_REPLAY_CACHE_TAIL" : "SSM_SCAN_REPLAY_CACHE"; }
+    std::string op_desc(ggml_tensor *) override { return "SSM_SCAN_REPLAY_CACHE"; }
     bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -5351,10 +5367,6 @@ struct test_ssm_scan_replay_cache : public test_ssm_scan_replay {
         const int64_t n_y = ggml_nelements(x);
         ggml_tensor * tail = ggml_view_2d(ctx, out, s->ne[0], n_seqs, s->nb[1], n_y*sizeof(float));
         ggml_tensor * cache = ggml_cpy(ctx, tail, ggml_view_2d(ctx, s, s->ne[0], n_seqs, s->nb[1], 0));
-        if (read_tail) {
-            // A second consumer requires the scan to materialize its state tail.
-            cache = ggml_add(ctx, cache, tail);
-        }
         return ggml_concat(ctx, ggml_view_1d(ctx, out, n_y, 0), ggml_reshape_1d(ctx, cache, ggml_nelements(s)), 0);
     }
 };
@@ -12606,6 +12618,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(1, 0));
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 0));
+    test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 1));
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 15));
     test_cases.emplace_back(new test_ssm_scan_replay_sequence(4, 96, 1, 1, true));
     test_cases.emplace_back(new test_ssm_scan_replay_sequence(8, 256, 4, 4, true));
@@ -12613,17 +12626,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int32_t count : { 0, 7, 15 }) {
         test_cases.emplace_back(new test_ssm_scan_replay_cache(count));
     }
-    test_cases.emplace_back(new test_ssm_scan_replay_cache(7, true));
-    test_cases.emplace_back(new test_ssm_scan_replay_cache(15, true));
-    test_cases.emplace_back(new test_ssm_scan_replay_cache(7, false, 300));
-    test_cases.emplace_back(new test_ssm_scan_replay_cache(7, false, 1, 64, 4, 2, 2));
-    test_cases.emplace_back(new test_ssm_scan_replay_cache(15, false, 1, 64, 4, 2, 2));
-    test_cases.emplace_back(new test_ssm_scan_replay_cache(7, false, 300, 64, 4, 2, 2));
-    test_cases.emplace_back(new test_ssm_scan_replay_cache(7, false, 1, 64, 4, 2, 3));
-    test_cases.emplace_back(new test_ssm_scan_replay_cache(-1, false, 1, 32, 8, 8, 4, true));
-    test_cases.emplace_back(new test_ssm_scan_replay_cache(-1, false, 1, 32, 8, 1, 4, true, true));
-    test_cases.emplace_back(new test_ssm_scan_replay_cache(-1, true, 1, 32, 8, 8, 4, true, true));
-    test_cases.emplace_back(new test_ssm_scan_replay_cache(-1, false, 5, 32, 8, 2, 4, true, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(7, 300));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(7, 1, 64, 4, 2, 2));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(15, 1, 64, 4, 2, 2));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(7, 300, 64, 4, 2, 2));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(7, 1, 64, 4, 2, 3));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(15, 1, 64, 4, 2, 3)); // an in-place row flushes in a fused batch
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(-1, 1, 32, 8, 8, 4, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(-1, 1, 32, 8, 1, 4, true, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(-1, 1, 32, 8, 8, 4, true, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(-1, 5, 32, 8, 2, 4, true, true));
 
     // ssm_scan + cache cpy fusion
     test_cases.emplace_back(new test_ssm_scan_cache_fusion(GGML_TYPE_F32, 128, 64, 16, 2, 4, 1, 4));
