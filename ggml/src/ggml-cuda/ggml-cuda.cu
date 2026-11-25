@@ -3717,7 +3717,7 @@ static int ggml_cuda_try_ssm_scan_cache_fusion(
         return 0;
     }
 
-    // The ordinary scan can overwrite another sequence's input row. Replay stages batched writes first.
+    // the scan reads its input rows from the cache (picked by ids), so with more than one seq a seq can read a row that another seq writes in the same launch (replay stages the rows that flush or move)
     if (!replay && n_seqs != 1) {
         return 0;
     }
@@ -3761,32 +3761,12 @@ static int ggml_cuda_try_ssm_scan_cache_fusion(
     }
 
     if (replay) {
+        // one-seq replay writes the cache row while it reads the source row: dst must be whole rows of s
         const ggml_tensor * s_base = s->view_src ? s->view_src : s;
         const size_t s_off = s->view_src ? s->view_offs : 0;
         if (dst->view_src != s_base || dst->view_offs < s_off ||
             (dst->view_offs - s_off) % s->nb[1] != 0) {
             return 0;
-        }
-        // The fused replay leaves its state tail unwritten. Only the matched copy may read it.
-        auto reads_tail = [&](const ggml_tensor * t) {
-            return t == ssm || (t && t->view_src == ssm &&
-                (t->view_offs > tail_off || ggml_nbytes(t) > tail_off - t->view_offs));
-        };
-        for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
-            const ggml_tensor * n = cgraph->nodes[j];
-            if (n == cpy) {
-                continue;
-            }
-            if ((n->flags & GGML_TENSOR_FLAG_OUTPUT) && reads_tail(n)) {
-                return 0;
-            }
-            if (!ggml_cuda_is_view_or_noop(n)) {
-                for (const ggml_tensor * input : n->src) {
-                    if (reads_tail(input)) {
-                        return 0;
-                    }
-                }
-            }
         }
     }
 
