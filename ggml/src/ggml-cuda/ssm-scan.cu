@@ -972,22 +972,23 @@ static __global__ void ssm_replay_scan(
     __shared__ float scale[32];
     __shared__ float total_decay;
     if (warp == 0) {
+        // lane l holds step n_steps - 1 - l: the sum of the lanes below it is the dt after that step (total - prefix loses it when |A| is large)
+        const int j = n_steps - 1 - lane;
         float step = 0.0f;
-        if (lane < n_steps && lane == count) {
+        if (j >= 0 && j == count) {
             const float dt_cur = dt[seq * p.dt_seq + head];
             step = dt_cur <= 20.0f ? log1pf(expf(dt_cur)) : dt_cur;
-        } else if (lane < n_steps) {
-            step = src[D + lane * record + inner + head];
+        } else if (j >= 0) {
+            step = src[D + j * record + inner + head];
         }
         const float prefix = warp_prefix_inclusive_sum(step);
-        const float total = warp_reduce_sum(step);
+        const float below  = ggml_cuda_shfl_up(prefix, 1, WARP_SIZE);
         const float a = A[head * p.A_head];
-        if (lane < n_steps) {
-            // The last input has no following decay; avoid cancellation for large A * dt.
-            scale[lane] = lane == n_steps - 1 ? step : step * expf(a * (total - prefix));
+        if (j >= 0) {
+            scale[j] = step * expf(a * (lane == 0 ? 0.0f : below));
         }
-        if (lane == 0) {
-            total_decay = n_steps == 0 ? 1.0f : expf(a * total);
+        if (lane == WARP_SIZE - 1) {
+            total_decay = expf(a * prefix);
         }
     }
     __syncthreads();
