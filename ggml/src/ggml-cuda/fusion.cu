@@ -569,13 +569,14 @@ static int ggml_cuda_try_ssm_scan_cache_fusion(
     }
 
     const int64_t K = ggml_get_op_params_i32(ssm, 0); // snapshot slot count
+    const bool replay = ggml_get_op_params_i32(ssm, 1) > 0;
 
     const ggml_tensor * s = ssm->src[0];
     const ggml_tensor * x = ssm->src[1];
     const ggml_tensor * A = ssm->src[3];
 
-    const int64_t d_state = s->ne[0];
-    const int64_t D       = d_state * s->ne[1] * x->ne[1]; // d_state * head_dim * n_head
+    const int64_t d_state = ssm->src[4]->ne[0];
+    const int64_t D       = replay ? s->ne[0] : d_state * s->ne[1] * x->ne[1];
     const int64_t n_tok   = x->ne[2];
     const int64_t n_seqs  = x->ne[3];
 
@@ -584,8 +585,8 @@ static int ggml_cuda_try_ssm_scan_cache_fusion(
         return 0;
     }
 
-    // the scan reads its input rows from the cache (picked by ids), so with more than one seq a seq can read a row that another seq writes in the same launch
-    if (n_seqs != 1) {
+    // the scan reads its input rows from the cache (picked by ids), so with more than one seq a seq can read a row that another seq writes in the same launch (replay stages the rows that flush or move)
+    if (!replay && n_seqs != 1) {
         return 0;
     }
 
@@ -625,6 +626,95 @@ static int ggml_cuda_try_ssm_scan_cache_fusion(
         !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
         dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
         return 0;
+    }
+
+    if (replay) {
+        auto unique_input = [&](int i) {
+            const ggml_tensor * input = ssm->src[i];
+            const ggml_tensor * base = ggml_cuda_view_base(input);
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                const ggml_tensor * other = ssm->src[k];
+                if (k != i && other && base == ggml_cuda_view_base(other)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        const ggml_tensor * s_base = ggml_cuda_view_base(s);
+        const size_t s_off = s->view_offs;
+        if (!unique_input(0) || dst->view_src != s_base || dst->view_offs < s_off ||
+            (dst->view_offs - s_off) % s->nb[1] != 0) {
+            return 0;
+        }
+
+        // Decode can also write the three history copies into the same sequence slots.
+        const size_t slot = (dst->view_offs - s_off) / s->nb[1];
+        if (n_seqs > s->ne[1] || slot > (size_t) (s->ne[1] - n_seqs)) {
+            return 0;
+        }
+        size_t end = tail_off + ggml_nbytes(src);
+        const ggml_tensor * copies[3] = {};
+        int i = 0, history_skip = skip;
+        for (int j = node_idx + skip + 1; n_tok == 1 && i < 3 && j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(n)) {
+                continue;
+            }
+            const ggml_tensor * h = ssm->src[7 + i];
+            const ggml_tensor * from = n->src[0];
+            const ggml_tensor * to = n->src[1];
+            if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                from->view_src != ssm || from->view_offs != end || !ggml_is_contiguous(from) ||
+                to->op != GGML_OP_VIEW || to->view_src != ggml_cuda_view_base(h) || !unique_input(7 + i) ||
+                to->view_offs != h->view_offs + slot * h->nb[1] || !to->data || to->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(to) || !ggml_is_matrix(to) || to->ne[0] != h->ne[0] || to->ne[1] != n_seqs) {
+                break;
+            }
+            copies[i++] = n;
+            end += ggml_nbytes(from);
+            history_skip = j - node_idx;
+        }
+        const bool write_history = i == 3;
+        if (!write_history) {
+            end = tail_off + ggml_nbytes(src);
+        }
+        // Graph views retain global use counts. Every use of the scan and its aliases must
+        // be accounted for before omitting writes that another scheduler split could read.
+        int uses = ggml_node_get_use_count(cgraph, node_idx);
+        if (uses == 0) {
+            return 0;
+        }
+        for (int j = node_idx + 1; j < cgraph->n_nodes && uses > 0; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (n->view_src == ssm) {
+                const int n_uses = ggml_node_get_use_count(cgraph, j);
+                uses += n_uses;
+                if (n->view_offs < end && (n->view_offs >= tail_off || ggml_nbytes(n) > tail_off - n->view_offs)) {
+                    const bool matched = n == src || (write_history &&
+                        (n == copies[0]->src[0] || n == copies[1]->src[0] || n == copies[2]->src[0]));
+                    if (!matched || n_uses != 1 || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                        return 0;
+                    }
+                }
+            }
+            for (const auto * input : n->src) {
+                if (input == ssm && !ggml_cuda_is_view_or_noop(n)) {
+                    return 0;
+                }
+                if (input == ssm || (input && input->view_src == ssm)) {
+                    --uses;
+                }
+            }
+        }
+        if (uses != 0) {
+            return 0;
+        }
+        if (write_history) {
+            for (int j = 0; j < 3; ++j) {
+                fused_state_cpy.history[j] = (float *) copies[j]->src[1]->data;
+            }
+            skip = history_skip;
+        }
     }
 
     fused_state_cpy.data        = (float *) dst->data; // rollback slot 0 (newest)
