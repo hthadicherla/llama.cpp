@@ -328,6 +328,8 @@ public:
     int64_t       n_conv   = 0;       // conv window columns, the widest conv of the model
     int64_t       n_pend   = 0;       // pending slots per seq
     ggml_tensor * rep_n    = nullptr; // I32 [n_seqs], kept pending tokens
+    ggml_tensor * rep_ids  = nullptr; // Mamba-2 source slots and retained lengths
+    ggml_tensor * seq_ids  = nullptr; // gathered Mamba-2 slots and lengths of the new verification block
     ggml_tensor * rep_cols = nullptr; // I32 [n_conv, n_seqs], conv history columns of the window after the kept tokens
 
     // views of rep_cols for the delta-net conv and the PLE conv windows, computed once per graph and shared across layers
@@ -1525,6 +1527,19 @@ struct llm_graph_context {
             ggml_tensor * conv_x,
                 int64_t   n_cols,
                  size_t   offs) const;
+
+    bool rs_replay_keep() const;
+
+    // The committed convolution window followed by pending columns. KDA can share gathered rows across blocks.
+    ggml_tensor * build_conv_state_replay(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        conv_states_all,
+            ggml_tensor *        x,
+            int64_t              n_conv,
+            int64_t              channels,
+            int                  il,
+            ggml_tensor *        hist_rows = nullptr,
+            int64_t              blk       = 0) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

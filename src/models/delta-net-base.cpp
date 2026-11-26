@@ -130,11 +130,11 @@ ggml_tensor * llm_build_delta_net_base::build_kda_conv1d(
 // the result and then runs its own tokens. Must match the rule in llama_memory_recurrent::find_slot.
 // Every ubatch builds the same nodes, with or without pending tokens, so the allocation planned at reserve time
 // stays valid and the scheduler never re-plans.
-static bool rs_replay_keep(const llama_cparams & cparams, int64_t n_seq_tokens) {
-    return n_seq_tokens >= 2 && n_seq_tokens <= (int64_t) cparams.n_rs_seq + 1;
+bool llm_graph_context::rs_replay_keep() const {
+    return ubatch.n_seq_tokens >= 2 && ubatch.n_seq_tokens <= (int64_t) cparams.n_rs_seq + 1;
 }
 
-ggml_tensor * llm_build_delta_net_base::build_conv_state_replay(
+ggml_tensor * llm_graph_context::build_conv_state_replay(
         llm_graph_input_rs * inp,
         ggml_tensor *        conv_states_all,
         ggml_tensor *        x,
@@ -142,7 +142,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state_replay(
         int64_t              channels,
         int                  il,
         ggml_tensor *        hist_rows,
-        int64_t              blk) {
+        int64_t              blk) const {
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head = mctx_cur->get_head();
@@ -184,7 +184,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state_replay(
     cb(conv_input, "conv_input", il);
 
     // keep: the new tokens stay pending behind the committed window, else commit the last n_conv columns
-    const int64_t n_dst = rs_replay_keep(cparams, n_seq_tokens) ? n_conv + n_seq_tokens : n_conv;
+    const int64_t n_dst = rs_replay_keep() ? n_conv + n_seq_tokens : n_conv;
 
     ggml_tensor * tail = ggml_view_3d(ctx0, cols, channels, n_dst, n_seqs, cols->nb[1], cols->nb[2],
             (n_conv + n_seq_tokens - n_dst)*cols->nb[1]);
@@ -242,7 +242,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn_replay(
     ggml_tensor * pv  = gather(spv,  cv);
     ggml_tensor * pgb = gather(spgb, cgb);
 
-    const bool keep = rs_replay_keep(cparams, n_seq_tokens);
+    const bool keep = rs_replay_keep();
 
     ggml_tensor * state_dst = ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1], kv_head*row_size);
 

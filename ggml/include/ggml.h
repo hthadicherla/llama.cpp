@@ -2315,6 +2315,8 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // For Mamba-2 with K == 1, ids may be I32 [n_seqs, 2]: source slots, then the valid input lengths.
+    // Positions past a sequence's length read no inputs, leave its state unchanged and return zero output.
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,

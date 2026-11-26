@@ -5725,7 +5725,8 @@ struct ggml_tensor * ggml_ssm_scan(
         GGML_ASSERT(B->ne[2] == n_seq_tokens);
         GGML_ASSERT(B->ne[3] == n_seqs);
         GGML_ASSERT(ids->ne[0] == n_seqs);
-        GGML_ASSERT(ggml_is_vector(ids));
+        GGML_ASSERT(ggml_is_vector(ids) ||
+            (ggml_is_matrix(ids) && ids->ne[1] == 2 && ggml_is_contiguous(ids) && A->ne[0] == 1 && K == 1));
         GGML_ASSERT(A->ne[1] == n_head);
         GGML_ASSERT(ggml_is_matrix(A));
 
@@ -5749,6 +5750,8 @@ struct ggml_tensor * ggml_ssm_scan(
     result->src[6] = ids;
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
+    // 0 is a fixed-length scan, -1 is a prefix scan, and positive values are ReplaySSM windows.
+    ggml_set_op_params_i32(result, 1, ids->ne[1] == 2 ? -1 : 0);
 
     return result;
 }

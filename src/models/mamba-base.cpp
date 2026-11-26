@@ -208,6 +208,54 @@ static ggml_tensor * build_mamba2_replay(ggml_context * ctx0, ggml_cgraph * gf, 
     return out;
 }
 
+ggml_tensor * llm_build_mamba_base::build_mamba2_verify(llm_graph_input_rs * inp, int il, ggml_tensor * x, ggml_tensor * dt,
+                                                        ggml_tensor * A, ggml_tensor * B, ggml_tensor * C) const {
+    const auto * mctx = inp->mctx;
+    const auto & history = mctx->get_mamba_replay(il);
+    const int64_t n_seqs = x->ne[3];
+    const int64_t n_pend = inp->n_pend;
+    const int64_t n_store = std::min(x->ne[2], n_pend);
+    ggml_tensor * s = mctx->get_s_l(il);
+    const auto gather = [&](ggml_tensor * cache, int64_t dim, int64_t heads) {
+        auto * rows = build_rs(inp, cache, cache->ne[0], n_seqs);
+        return ggml_reshape_4d(ctx0, rows, dim, heads, n_pend, n_seqs);
+    };
+    auto * px = gather(history.x, x->ne[0], x->ne[1]);
+    auto * pB = gather(history.b, B->ne[0], B->ne[1]);
+    auto * pd = ggml_reshape_3d(ctx0, gather(history.dt, dt->ne[0], 1), dt->ne[0], n_pend, n_seqs);
+
+    const auto replay = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor *) {
+        auto * state = ggml_reshape_4d(ctx, states, B->ne[0], x->ne[0], x->ne[1], states->ne[1]);
+        // Only the final state is consumed. B can stand in for the unused readout C.
+        auto * scan = ggml_ssm_scan(ctx, state, px, pd, A, pB, pB, inp->rep_ids, 1);
+        cb(scan, "ssm_replay_prefix", il);
+        return ggml_view_4d(ctx, scan, state->ne[0], state->ne[1], state->ne[2], n_seqs,
+                            state->nb[1], state->nb[2], state->nb[3], ggml_nbytes(px));
+    };
+    auto * committed = build_rs(inp, s, s->ne[0], n_seqs, replay);
+    auto * scan = ggml_ssm_scan(ctx0, committed, x, dt, A, B, C, inp->seq_ids, 1);
+    ggml_build_forward_expand(gf, scan);
+
+    const bool keep = rs_replay_keep();
+    auto * end = ggml_view_2d(ctx0, keep ? committed : scan, s->ne[0], n_seqs, s->nb[1],
+                             keep ? 0 : ggml_nelements(x)*sizeof(float));
+    auto * dst = ggml_view_2d(ctx0, s, s->ne[0], n_seqs, s->nb[1], mctx->get_head()*s->nb[1]);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, end, dst));
+
+    // Store the biased dt before softplus so replay uses the same scan as verification.
+    const auto store = [&](ggml_tensor * cache, ggml_tensor * input) {
+        auto * src = ggml_view_4d(ctx0, input, input->ne[0], input->ne[1], n_store, n_seqs,
+                                  input->nb[1], input->nb[2], input->nb[3], 0);
+        auto * dst = ggml_view_3d(ctx0, cache, input->ne[0]*input->ne[1], n_store, n_seqs, cache->nb[1]/n_pend,
+                                  cache->nb[1], mctx->get_head()*cache->nb[1]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+    };
+    store(history.x,  x);
+    store(history.dt, ggml_reshape_4d(ctx0, dt, dt->ne[0], 1, dt->ne[1], dt->ne[2]));
+    store(history.b,  B);
+    return scan;
+}
+
 ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
                                                           ggml_tensor *        cur,
                                                           const llama_ubatch & ubatch,
@@ -238,9 +286,6 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
     const int64_t state_slots     = ssm_states_all->ne[1];
 
-    ggml_tensor * conv = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
-    conv               = ggml_reshape_3d(ctx0, conv, d_conv - 1, d_inner + 2 * n_group * d_state, n_seqs);
-
     // d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
 
     // Keep the projection 2D: with a {n_embd, 1, n_seqs} batch the CUDA backend
@@ -261,9 +306,16 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
     // conv
     {
         // => {d_conv - 1 + n_seq_tokens, d_inner + 2*n_group*d_state, n_seqs}
-        ggml_tensor * conv_x = ggml_concat(ctx0, conv, ggml_transpose(ctx0, xBC), 0);
-
-        build_conv_state_store(inp, conv_states_all, conv_x, d_conv - 1, 0);
+        ggml_tensor * conv_x;
+        const int64_t channels = d_inner + 2*n_group*d_state;
+        if (inp->seq_ids) {
+            conv_x = build_conv_state_replay(inp, conv_states_all, xBC, d_conv - 1, channels, il);
+        } else {
+            ggml_tensor * conv = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+            conv = ggml_reshape_3d(ctx0, conv, d_conv - 1, channels, n_seqs);
+            conv_x = ggml_concat(ctx0, conv, ggml_transpose(ctx0, xBC), 0);
+            build_conv_state_store(inp, conv_states_all, conv_x, d_conv - 1, 0);
+        }
 
         // 1D convolution
         // The equivalent is to make a self-overlapping view of conv_x
@@ -310,7 +362,9 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         };
 
         ggml_tensor * y_ssm;
-        if (mctx_cur->get_mamba_replay(il).x) {
+        if (inp->seq_ids) {
+            y_ssm = build_mamba2_verify(inp, il, x, dt, A, B, C);
+        } else if (mctx_cur->get_mamba_replay(il).x) {
             y_ssm = build_mamba2_replay(ctx0, gf, inp, il, x, dt, A, B, C, cparams.ssm_replay_window);
         } else {
             y_ssm = build_rs(inp, ssm_states_all, ssm_states_all->ne[0], ubatch.n_seqs, get_ssm_rows);

@@ -10196,7 +10196,15 @@ static void ggml_compute_forward_ssm_scan_f32(
         float * s = (float *) ((char *) dst->data + s_off) + i3*(nc*nr*nh);
         const float * s0 = state_in_dst ? s : (const float *) ((const char *) src0->data + ids[i3]*src0->nb[3]);
 
-        for (int i2 = 0; i2 < nt; ++i2) {
+        const int64_t length = ggml_get_op_params_i32(dst, 1) < 0 ? ids[ns + i3] : nt;
+        GGML_ASSERT(length >= 0 && length <= nt);
+        if (length == 0 && ih0 < ih1) {
+            memcpy(s + ih0*nr*nc, s0 + ih0*nr*nc, (ih1 - ih0)*nr*nc*sizeof(float));
+        }
+        for (int64_t i2 = length; i2 < nt && ih0 < ih1; ++i2) {
+            memset((float *) dst->data + ((i3*nt + i2)*nh + ih0)*nr, 0, (ih1 - ih0)*nr*sizeof(float));
+        }
+        for (int i2 = 0; i2 < length; ++i2) {
             const float * x  = (const float *) ((const char *) src1->data + i2*(src1->nb[2]) + i3*(src1->nb[3])); // {dim, nh, nt, ns}
             const float * dt = (const float *) ((const char *) src2->data + i2*(src2->nb[1]) + i3*(src2->nb[2])); // {nh, nt, ns}
             const float * A  = (const float *) ((const char *) src3->data); // {d_state, nh} or {1, nh}
@@ -10509,7 +10517,7 @@ void ggml_compute_forward_ssm_scan(
     switch (dst->src[0]->type) {
         case GGML_TYPE_F32:
             {
-                if (ggml_get_op_params_i32(dst, 1) != 0) {
+                if (ggml_get_op_params_i32(dst, 1) > 0) {
                     ggml_compute_forward_ssm_scan_replay(params, dst);
                 } else {
                     ggml_compute_forward_ssm_scan_f32(params, dst);

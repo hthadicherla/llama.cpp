@@ -28,6 +28,8 @@ struct llm_build_mamba_base : public llm_graph_context {
 
     ggml_tensor * build_mamba_layer(llm_graph_input_rs * inp, ggml_tensor * cur, const llama_ubatch & ubatch, int il);
     ggml_tensor * build_mamba2_layer(llm_graph_input_rs * inp, ggml_tensor * cur, const llama_ubatch & ubatch, int il) const;
+    ggml_tensor * build_mamba2_verify(llm_graph_input_rs * inp, int il, ggml_tensor * x, ggml_tensor * dt,
+                                     ggml_tensor * A, ggml_tensor * B, ggml_tensor * C) const;
 
 };
 
@@ -81,20 +83,6 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        b,
             ggml_tensor *        s,
             int                  il);
-
-    // rs_replay variants: replay the kept pending tokens, then keep or commit the new ones [TAG_RECURRENT_REPLAY]
-    // x: [channels, n_seq_tokens, n_seqs] new conv inputs; returns [n_conv + n_seq_tokens, channels, n_seqs]
-    // a row of conv_states_all can hold several histories [channels, n_conv + n_pend] one after the other (KDA: q, k, v):
-    // blk picks one, and hist_rows are the rows of the ubatch cells (build_rs) shared by the blocks, nullptr gathers them
-    ggml_tensor * build_conv_state_replay(
-            llm_graph_input_rs * inp,
-            ggml_tensor *        conv_states_all,
-            ggml_tensor *        x,
-            int64_t              n_conv,
-            int64_t              channels,
-            int                  il,
-            ggml_tensor *        hist_rows = nullptr,
-            int64_t              blk       = 0);
 
     ggml_tensor * build_recurrent_attn_replay(
             llm_graph_input_rs * inp,

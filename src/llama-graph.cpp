@@ -554,12 +554,20 @@ void llm_graph_input_rs::set_input_rep(const llama_memory_recurrent_context * mc
 
     GGML_ASSERT(ggml_backend_buffer_is_host(rep_n->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(rep_cols->buffer));
+    if (seq_ids) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(seq_ids->buffer));
+    }
 
     for (int64_t s = 0; s < n_seqs; ++s) {
         const int64_t n_rep = mctx->get_rs_rep(s);
         GGML_ASSERT(n_rep <= n_pend);
 
         reps[s] = n_rep;
+        if (seq_ids) {
+            int32_t * ids = (int32_t *) seq_ids->data;
+            ids[s] = s;
+            ids[n_seqs + s] = ubatch->n_seq_tokens;
+        }
 
         // the conv history is [window | pending]: the window after the kept tokens
         for (int64_t c = 0; c < n_conv; ++c) {
@@ -4247,6 +4255,12 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         inp->rep_n = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
         ggml_set_input(inp->rep_n);
         ggml_set_name(inp->rep_n, "rs_rep_n");
+        if (cparams.ssm_replay_window) {
+            inp->rep_ids = ggml_concat(ctx0, inp->s_copy_main, inp->rep_n, 1);
+            inp->seq_ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_seqs, 2);
+            ggml_set_input(inp->seq_ids);
+            ggml_set_name(inp->seq_ids, "ssm_verify_ids");
+        }
     }
 
     return inp;

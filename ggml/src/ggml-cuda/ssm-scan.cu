@@ -149,7 +149,7 @@ __global__ void __launch_bounds__(d_state, 1)
         const int src0_nb2, const int src0_nb3, const int src1_nb2, const int src1_nb3,
         const int src2_nb1, const int src2_nb2, const int src3_nb1,
         const int src4_nb2, const int src4_nb3, const int src5_nb2, const int src5_nb3,
-        char * s_base, const int64_t s_slot_bytes, const int64_t n_head, const int64_t d_head, const int64_t n_group, const int64_t n_tok, const int64_t K) {
+        char * s_base, const int64_t s_slot_bytes, const int64_t n_head, const int64_t d_head, const int64_t n_group, const int64_t n_tok, const int64_t K, const int32_t * lengths) {
     const float   * GGML_CUDA_RESTRICT src0 = src0_ptr;
     const float   * GGML_CUDA_RESTRICT src1 = src1_ptr;
     const float   * GGML_CUDA_RESTRICT src2 = src2_ptr;
@@ -201,7 +201,11 @@ __global__ void __launch_bounds__(d_state, 1)
         state[j] = s0_warp[WARP_SIZE * j + lane];
     }
 
-    for (int64_t i = 0; i < n_tok; i++) {
+    const int64_t length = lengths ? lengths[seq_idx] : n_tok;
+    if (length < 0 || length > n_tok) {
+        __trap();
+    }
+    for (int64_t i = 0; i < length; i++) {
         // NOTE: dt_soft_plus, dA and x_dt have the same value for a warp here.
         // Recalculation is intentional; sharing via shuffles/smem proved slower due to sync overhead.
         const float dt_soft_plus = (dt_warp[i * stride_dt] <= 20.0f ? log1pf(expf(dt_warp[i * stride_dt])) : dt_warp[i * stride_dt]);
@@ -235,6 +239,11 @@ __global__ void __launch_bounds__(d_state, 1)
         }
     }
 
+    if (lane == 0) {
+        for (int64_t i = length; i < n_tok; ++i) {
+            y_warp[i * stride_y] = 0.0f;
+        }
+    }
     // write back the state
 #pragma unroll
     for (int j = 0; j < c_factor; j++) {
@@ -248,7 +257,7 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
                               const int src2_nb2, const int src3_nb1, const int src4_nb2, const int src4_nb3, const int src5_nb2,
                               const int src5_nb3, const int64_t s_off, const int64_t d_state, const int64_t head_dim,
                               const int64_t n_head, const int64_t n_group, const int64_t n_tok, const int64_t n_seq,
-                              const int64_t K, const ggml_cuda_ssm_scan_fused_cache * cache, cudaStream_t stream) {
+                              const int64_t K, const int32_t * lengths, const ggml_cuda_ssm_scan_fused_cache * cache, cudaStream_t stream) {
     // when fused, the states go straight into the recurrent cache and the dst tail is left alone
     char * const  s_base       = cache ? (char *) cache->data : (char *) dst + s_off;
     const int64_t s_slot_bytes = cache ? cache->slot_stride * (int64_t) sizeof(float) : n_seq * (int64_t) src0_nb3;
@@ -265,7 +274,7 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
             ggml_cuda_kernel_launch(ssm_scan_f32_group<64/WARP_SIZE, 64>, launch_params,
                     src0, src1, src2, src3, src4, src5, src6, dst,
                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
-                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_base, s_slot_bytes, n_head, head_dim, n_group, n_tok, K);
+                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_base, s_slot_bytes, n_head, head_dim, n_group, n_tok, K, lengths);
         } else if (d_state == 96) {
             constexpr int threads   = 96;
             constexpr int num_warps = threads/WARP_SIZE;
@@ -275,7 +284,7 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
             ggml_cuda_kernel_launch(ssm_scan_f32_group<96/WARP_SIZE, 96>, launch_params,
                     src0, src1, src2, src3, src4, src5, src6, dst,
                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
-                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_base, s_slot_bytes, n_head, head_dim, n_group, n_tok, K);
+                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_base, s_slot_bytes, n_head, head_dim, n_group, n_tok, K, lengths);
         } else if (d_state == 128) {
             constexpr int threads   = 128;
             constexpr int num_warps = threads/WARP_SIZE;
@@ -285,7 +294,7 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
             ggml_cuda_kernel_launch(ssm_scan_f32_group<128/WARP_SIZE, 128>, launch_params,
                     src0, src1, src2, src3, src4, src5, src6, dst,
                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
-                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_base, s_slot_bytes, n_head, head_dim, n_group, n_tok, K);
+                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_base, s_slot_bytes, n_head, head_dim, n_group, n_tok, K, lengths);
         } else if (d_state == 256) { // Falcon-H1
             constexpr int threads   = 256;
             constexpr int num_warps = threads/WARP_SIZE;
@@ -295,7 +304,7 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
             ggml_cuda_kernel_launch(ssm_scan_f32_group<256/WARP_SIZE, 256>, launch_params,
                     src0, src1, src2, src3, src4, src5, src6, dst,
                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
-                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_base, s_slot_bytes, n_head, head_dim, n_group, n_tok, K);
+                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_base, s_slot_bytes, n_head, head_dim, n_group, n_tok, K, lengths);
         } else {
             GGML_ABORT("doesn't support d_state!=(64, 96, 128 or 256).");
         }
@@ -800,7 +809,7 @@ static void ggml_cuda_op_ssm_scan_replay(ggml_backend_cuda_context & ctx, ggml_t
 
 static void ggml_cuda_op_ssm_scan_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                        const ggml_cuda_ssm_scan_fused_cache * cache) {
-    if (ggml_get_op_params_i32(dst, 1) != 0) {
+    if (ggml_get_op_params_i32(dst, 1) > 0) {
         ggml_cuda_op_ssm_scan_replay(ctx, dst, cache);
         return;
     }
@@ -841,6 +850,7 @@ static void ggml_cuda_op_ssm_scan_impl(ggml_backend_cuda_context & ctx, ggml_ten
     const float * src4_d = (const float *) src4->data;
     const float * src5_d = (const float *) src5->data;
     const int32_t * src6_d = (const int32_t *) src6->data;
+    const int32_t * lengths = ggml_get_op_params_i32(dst, 1) < 0 ? src6_d + n_s : nullptr;
     float *       dst_d  = (float *) dst->data;
     cudaStream_t  stream = ctx.stream();
 
@@ -867,7 +877,7 @@ static void ggml_cuda_op_ssm_scan_impl(ggml_backend_cuda_context & ctx, ggml_ten
     const bool is_mamba2 = (src3->nb[1] == sizeof(float));
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool use_ssd = is_mamba2 && n_t > SSM_SSD_MIN_TOKENS
-                      && K == 1
+                      && K == 1 && !lengths
                       && n_t <= SSM_SSD_MAX_TOKENS
                       && GGML_CUDA_CC_IS_NVIDIA(cc)
                       && cc >= GGML_CUDA_CC_TURING
@@ -895,7 +905,7 @@ static void ggml_cuda_op_ssm_scan_impl(ggml_backend_cuda_context & ctx, ggml_ten
     ssm_scan_f32_cuda(src0_d, src1_d, src2_d, src3_d, src4_d, src5_d, src6_d, dst_d,
                       src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3], src2->nb[1], src2->nb[2],
                       src3->nb[1], src4->nb[2], src4->nb[3], src5->nb[2], src5->nb[3],
-                      s_off, nc, nr, nh, ng, n_t, n_s, K, cache, stream);
+                      s_off, nc, nr, nh, ng, n_t, n_s, K, lengths, cache, stream);
 }
 
 struct ssm_replay_params {

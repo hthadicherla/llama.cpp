@@ -20,6 +20,7 @@
 
 // State data layout: 0 is ordinary, 1 is transposed, 2 adds separate Mamba replay tensors.
 static constexpr uint32_t MAMBA_REPLAY_LAYOUT = 2;
+static constexpr uint32_t MAMBA_VERIFY_LAYOUT = 3;
 
 llama_memory_recurrent::llama_memory_recurrent(
         const llama_model & model,
@@ -43,7 +44,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     this->rs_replay = rs_replay && n_rs_seq > 0;
     rs_idx.assign(n_seq_max, 0);
 
-    const bool replay = replay_window > 0 && n_rs_seq == 0 && type_s == GGML_TYPE_F32 && hparams.ssm_n_group > 0;
+    const bool replay = replay_window > 0 && (n_rs_seq == 0 || this->rs_replay) && type_s == GGML_TYPE_F32 && hparams.ssm_n_group > 0;
 
     cells.clear();
     cells.resize(mem_size);
@@ -134,11 +135,13 @@ llama_memory_recurrent::llama_memory_recurrent(
             history.x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, replay_window*d_inner,         mem_size);
             history.dt    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, replay_window*n_head,          mem_size);
             history.b     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, replay_window*d_state*n_group, mem_size);
-            history.count = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1,                            mem_size);
             ggml_format_name(history.x,     "cache_mamba_x_l%d",     i);
             ggml_format_name(history.dt,    "cache_mamba_dt_l%d",    i);
             ggml_format_name(history.b,     "cache_mamba_b_l%d",     i);
-            ggml_format_name(history.count, "cache_mamba_count_l%d", i);
+            if (!this->rs_replay) {
+                history.count = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, mem_size);
+                ggml_format_name(history.count, "cache_mamba_count_l%d", i);
+            }
             mamba_replay_window = replay_window;
             LLAMA_LOG_DEBUG("%s: layer %3d: ReplaySSM window = %u\n", __func__, i, replay_window);
         }
@@ -151,7 +154,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         r_l[i] = r;
         s_l[i] = s;
 
-        if (this->rs_replay) {
+        if (this->rs_replay && !replay) {
             // k [S_k, H_k, n_pend], v [S_v, H_v, n_pend], gb [g0, H_v, 2*n_pend]: separate rows, so that a split by heads
             // is one axis of each (-sm tensor). The gate is a scalar per head (g0 = 1), or per key dim for KDA (g0 = S_v)
             const bool    kda  = hparams.n_embd_head_kda != 0;
@@ -865,7 +868,7 @@ size_t llama_memory_recurrent::size_s_bytes() const {
 }
 
 std::array<ggml_tensor *, 4> llama_memory_recurrent::pending_rows(uint32_t il) const {
-    if (rs_replay) {
+    if (!mamba_replay_l[il].x) {
         return { spk_l[il], spv_l[il], spgb_l[il], nullptr };
     }
     const auto & h = mamba_replay_l[il];
@@ -889,6 +892,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
+    std::vector<uint32_t> pending;
     uint32_t cell_count = 0;
 
     // Count the number of cells with the specified seq_id
@@ -899,6 +903,9 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
         // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
         if ((seq_id == -1 && !cell.is_empty()) || cell.has_seq_id(seq_id)) {
             ++cell_count;
+            if (mamba_replay_window && rs_replay) {
+                pending.push_back(cell.rs_pend);
+            }
             uint32_t rs_idx_cur = 0;
 
             if (n_rs_seq != 0) {
@@ -962,7 +969,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     io.write(&cell_count, sizeof(cell_count));
 
     state_write_meta(io, cell_ranges, seq_id);
-    state_write_data(io, cell_ranges_data);
+    state_write_data(io, cell_ranges_data, pending);
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -1010,20 +1017,24 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
                 }
             }
 
-            if (rs_replay) {
+            if (rs_replay && !mamba_replay_window) {
                 io.write(&cell.rs_pend, sizeof(cell.rs_pend));
             }
         }
     }
 }
 
-void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
-    const uint32_t layout  = mamba_replay_window ? MAMBA_REPLAY_LAYOUT : 0;
+void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+                                              const std::vector<uint32_t> & pending) const {
+    const uint32_t layout  = mamba_replay_window ? (rs_replay ? MAMBA_VERIFY_LAYOUT : MAMBA_REPLAY_LAYOUT) : 0;
     const bool     s_trans = false;
     const uint32_t n_layer = hparams.n_layer();
 
     io.write(&layout, sizeof(layout));
     io.write(&n_layer, sizeof(n_layer));
+    if (!pending.empty()) {
+        io.write(pending.data(), pending.size()*sizeof(uint32_t));
+    }
 
     // Iterate and write all the R tensors first, each row is a cell
     // Get whole range at a time
@@ -1161,7 +1172,7 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
                 return false;
             }
 
-            if (rs_replay) {
+            if (rs_replay && !mamba_replay_window) {
                 io.read(&rs_pend[i], sizeof(rs_pend[i]));
             }
 
@@ -1227,7 +1238,7 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
                 tail = i;
             }
 
-            if (rs_replay) {
+            if (rs_replay && !mamba_replay_window) {
                 io.read(&cell.rs_pend, sizeof(cell.rs_pend));
             }
         }
@@ -1260,9 +1271,19 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         return false;
     }
     const bool s_trans = layout == 1;
-    if (layout != 0 && !(layout == MAMBA_REPLAY_LAYOUT && mamba_replay_window)) {
+    const uint32_t expected = mamba_replay_window ? (rs_replay ? MAMBA_VERIFY_LAYOUT : MAMBA_REPLAY_LAYOUT) : 0;
+    if (layout != expected && !(layout == 0 && expected == MAMBA_REPLAY_LAYOUT)) {
         LLAMA_LOG_ERROR("%s: incompatible recurrent cache layout %u\n", __func__, layout);
         return false;
+    }
+    if (layout == MAMBA_VERIFY_LAYOUT) {
+        for (uint32_t i = head; i < head + cell_count; ++i) {
+            io.read(&cells[i].rs_pend, sizeof(cells[i].rs_pend));
+            if (cells[i].rs_pend > n_rs_seq + 1) {
+                LLAMA_LOG_ERROR("%s: invalid pending ReplaySSM length\n", __func__);
+                return false;
+            }
+        }
     }
 
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block

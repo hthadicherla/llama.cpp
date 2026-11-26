@@ -4419,7 +4419,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SSM_SCAN: {
             const int32_t K = ggml_get_op_params_i32(op, 0);
             const int32_t window = ggml_get_op_params_i32(op, 1);
-            if (window != 0) {
+            if (window > 0) {
                 if (K != 1 || window < 1 || window > 32 || op->src[3]->ne[0] != 1 ||
                     op->type != GGML_TYPE_F32 || op->src[6]->type != GGML_TYPE_I32) {
                     return false;
@@ -4443,7 +4443,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 // Mamba2
                 // Only the ordinary scan supports d_state == 64.
                 const int64_t d_state = op->src[4]->ne[0];
-                return ((window == 0 && d_state == 64) || d_state == 96 || d_state == 128 || d_state == 256) && op->src[1]->ne[0] % 16 == 0;
+                return ((window <= 0 && d_state == 64) || d_state == 96 || d_state == 128 || d_state == 256) && op->src[1]->ne[0] % 16 == 0;
             } else {
                 if (K > 1) {
                     return false;

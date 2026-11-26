@@ -5992,6 +5992,7 @@ struct test_ssm_scan_rollback : public test_case {
     const int64_t n_seq_tokens;
     const int64_t n_seqs;
     const int64_t K;
+    const bool    lengths;
 
     std::string vars() override {
         return VARS_TO_STR8(type, d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, K);
@@ -5999,7 +6000,7 @@ struct test_ssm_scan_rollback : public test_case {
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "SSM_SCAN_ROLLBACK";
+        return lengths ? "SSM_SCAN_PREFIX" : "SSM_SCAN_ROLLBACK";
     }
 
     bool run_whole_graph() override {
@@ -6026,9 +6027,9 @@ struct test_ssm_scan_rollback : public test_case {
             int64_t n_group = 2,
             int64_t n_seq_tokens = 8,
             int64_t n_seqs = 2,
-            int64_t K = 3)
+            int64_t K = 3, bool lengths = false)
         : type(type), d_state(d_state), head_dim(head_dim), n_head(n_head), n_group(n_group),
-          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K) {}
+          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K), lengths(lengths) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * s   = ggml_new_tensor_4d(ctx, type, d_state,  head_dim,     n_head,       n_seqs);
@@ -6043,6 +6044,19 @@ struct test_ssm_scan_rollback : public test_case {
 
         const int64_t y_elems     = head_dim * n_head * n_seq_tokens * n_seqs;
         const int64_t state_elems = d_state  * head_dim * n_head      * n_seqs;
+
+        if (lengths) {
+            GGML_ASSERT(n_seqs == 2 && K == 1);
+            // Sequence 0 keeps no inputs, and sequence 1 keeps the entire block.
+            auto * counts = ggml_cast(ctx, ggml_arange(ctx, 0, 2*n_seq_tokens, n_seq_tokens), GGML_TYPE_I32);
+            auto * scan = ggml_ssm_scan(ctx, s, x, dt, A, B, C, ggml_concat(ctx, ids, counts, 1), 1);
+            auto * initial = ggml_get_rows(ctx, ggml_reshape_2d(ctx, s, state_elems/2, 2), ids);
+            auto * zero = ggml_scale(ctx, ggml_view_1d(ctx, full, y_elems/2, 0), 0.0f);
+            auto * expected = ggml_set_1d(ctx, full, zero, 0);
+            expected = ggml_set_1d(ctx, expected, ggml_view_1d(ctx, initial, state_elems/2, 0),
+                    y_elems*ggml_element_size(full));
+            return ggml_sum(ctx, ggml_sqr(ctx, ggml_sub(ctx, scan, expected)));
+        }
 
         ggml_tensor * out = nullptr;
         for (int64_t slot = 0; slot < K; ++slot) {
@@ -13548,6 +13562,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 4, 2, false, /*K=*/4)); // Mamba-2 rollback snapshots
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 8, 2, false, /*K=*/3)); // Mamba-2 rollback overflow
     test_cases.emplace_back(new test_ssm_scan_rollback(GGML_TYPE_F32, 128, 64, 16, 2, 8, 2, /*K=*/3)); // rollback snapshots match prefix states
+    test_cases.emplace_back(new test_ssm_scan_rollback(GGML_TYPE_F32, 128, 64, 16, 2, 8, 2, /*K=*/1, /*lengths=*/true));
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 64, 4)); // Metal SSD one chunk MMA only, no seq tail
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 65, 2)); // SSD one chunk + 1-token sequential tail
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 128, 2)); // SSD multi-chunk, no tail (exercises the chunk-to-chunk state handoff)
