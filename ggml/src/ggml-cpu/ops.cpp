@@ -10420,7 +10420,6 @@ static void ggml_compute_forward_ssm_scan_replay(
         const bool flush = nt > 1 || count + 1 == window;
 
         if (params->ith == 0) {
-            memcpy(s, s0, n_state*sizeof(float));
             if (flush) {
                 memset(next_x,  0, x_cache->ne[0]*sizeof(float));
                 memset(next_dt, 0, dt_cache->ne[0]*sizeof(float));
@@ -10471,9 +10470,11 @@ static void ggml_compute_forward_ssm_scan_replay(
                             delta += x_steps[j][h*nr + m]*(B_steps[j][n]*scales[j]);
                         }
                         s[i] = s0[i]*total_decay + delta;
+                    } else {
+                        s[i] = s0[i];
                     }
                     if (nt == 1) {
-                        sum += (flush ? s[i] : s0[i])*C[n];
+                        sum += s[i]*C[n];
                     }
                 }
                 if (!flush) {
