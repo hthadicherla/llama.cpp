@@ -18,6 +18,9 @@
 // llama_memory_recurrent
 //
 
+// State data layout: 0 is ordinary, 1 is transposed, 2 adds separate Mamba replay tensors.
+static constexpr uint32_t MAMBA_REPLAY_LAYOUT = 2;
+
 llama_memory_recurrent::llama_memory_recurrent(
         const llama_model & model,
                  bool   no_alloc,
@@ -58,8 +61,8 @@ llama_memory_recurrent::llama_memory_recurrent(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                // r and s per layer, plus the separate PLE conv row where the model has one
-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 6u : 5u)*n_layer*ggml_tensor_overhead()),
+                // r, s, optional PLE, and either the GDN pending inputs or the Mamba replay history
+                /*.mem_size   =*/ (2u + (hparams.ple_conv_state() > 0) + (replay ? 4u : 3u))*n_layer*ggml_tensor_overhead(),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -83,6 +86,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     spk_l.resize(n_layer);
     spv_l.resize(n_layer);
     spgb_l.resize(n_layer);
+    mamba_replay_l.resize(n_layer);
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -114,7 +118,6 @@ llama_memory_recurrent::llama_memory_recurrent(
         const int64_t n_ch     = hparams.n_embd_r() / std::max<int64_t>(1, hparams.ssm_d_conv - 1);
         const int64_t n_embd_r = this->rs_replay ? n_ch*(hparams.ssm_d_conv - 1 + n_pend) : hparams.n_embd_r();
 
-        int64_t n_embd_s = hparams.n_embd_s();
         const auto & layer = model.layers[i];
         if (replay && layer.ssm_in && layer.ssm_d && layer.ssm_a && layer.ssm_a->ne[0] == 1 && layer.ssm_a->ne[1] == hparams.ssm_dt_rank) {
             const uint64_t d_inner = hparams.ssm_d_inner;
@@ -124,18 +127,25 @@ llama_memory_recurrent::llama_memory_recurrent(
             if (n_head == 0 || d_inner == 0 || d_state == 0 || d_inner % n_head != 0 || n_head % n_group != 0 || d_state * d_inner >= INT32_MAX) {
                 throw std::runtime_error("invalid ReplaySSM state dimensions");
             }
-            const uint64_t record_size = d_inner + n_head + d_state * n_group;
-            const uint64_t state_size = d_state * d_inner + replay_window * record_size + 1;
-            if (state_size > INT32_MAX) {
+            if (d_state * d_inner + replay_window * (d_inner + n_head + d_state * n_group) + 1 > INT32_MAX) {
                 throw std::runtime_error("ReplaySSM state row is too large");
             }
-            n_embd_s = state_size;
+            auto & history = mamba_replay_l[i];
+            history.x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, replay_window*d_inner,         mem_size);
+            history.dt    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, replay_window*n_head,          mem_size);
+            history.b     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, replay_window*d_state*n_group, mem_size);
+            history.count = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1,                            mem_size);
+            ggml_format_name(history.x,     "cache_mamba_x_l%d",     i);
+            ggml_format_name(history.dt,    "cache_mamba_dt_l%d",    i);
+            ggml_format_name(history.b,     "cache_mamba_b_l%d",     i);
+            ggml_format_name(history.count, "cache_mamba_count_l%d", i);
+            mamba_replay_window = replay_window;
             LLAMA_LOG_DEBUG("%s: layer %3d: ReplaySSM window = %u\n", __func__, i, replay_window);
         }
 
         const uint32_t n_rows = mem_size * (this->rs_replay ? 1 : 1 + n_rs_seq);
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, n_embd_r, n_rows);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, n_embd_s, n_rows);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
@@ -843,8 +853,8 @@ size_t llama_memory_recurrent::size_s_bytes() const {
         }
     }
 
-    for (const auto * sp : { &spk_l, &spv_l, &spgb_l }) {
-        for (const auto & s : *sp) {
+    for (uint32_t il = 0; il < s_l.size(); ++il) {
+        for (const auto * s : pending_rows(il)) {
             if (s != nullptr) {
                 size_s_bytes += ggml_nbytes(s);
             }
@@ -852,6 +862,14 @@ size_t llama_memory_recurrent::size_s_bytes() const {
     }
 
     return size_s_bytes;
+}
+
+std::array<ggml_tensor *, 4> llama_memory_recurrent::pending_rows(uint32_t il) const {
+    if (rs_replay) {
+        return { spk_l[il], spv_l[il], spgb_l[il], nullptr };
+    }
+    const auto & h = mamba_replay_l[il];
+    return { h.x, h.dt, h.b, h.count };
 }
 
 size_t llama_memory_recurrent::size_p_bytes() const {
@@ -1000,10 +1018,11 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
 }
 
 void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
-    const uint32_t s_trans = 0;
+    const uint32_t layout  = mamba_replay_window ? MAMBA_REPLAY_LAYOUT : 0;
+    const bool     s_trans = false;
     const uint32_t n_layer = hparams.n_layer();
 
-    io.write(&s_trans, sizeof(s_trans));
+    io.write(&layout, sizeof(layout));
     io.write(&n_layer, sizeof(n_layer));
 
     // Iterate and write all the R tensors first, each row is a cell
@@ -1093,10 +1112,10 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         }
     }
 
-    // rs_replay pending inputs travel with their cells
-    if (rs_replay) {
+    // Pending inputs travel with their cells.
+    if (rs_replay || mamba_replay_window) {
         for (uint32_t il = 0; il < n_layer; ++il) {
-            for (ggml_tensor * t : { spk_l[il], spv_l[il], spgb_l[il] }) {
+            for (ggml_tensor * t : pending_rows(il)) {
                 if (t == nullptr) continue;
 
                 const uint64_t size_row = t->nb[1];
@@ -1227,9 +1246,9 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
 }
 
 bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell_count, llama_state_seq_flags flags) {
-    uint32_t s_trans;
+    uint32_t layout;
     uint32_t n_layer;
-    io.read(&s_trans, sizeof(s_trans));
+    io.read(&layout, sizeof(layout));
     io.read(&n_layer, sizeof(n_layer));
 
     if (n_layer != hparams.n_layer()) {
@@ -1240,8 +1259,9 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, size);
         return false;
     }
-    if (false != (bool) s_trans) {
-        LLAMA_LOG_ERROR("%s: incompatible s transposition\n", __func__);
+    const bool s_trans = layout == 1;
+    if (layout != 0 && !(layout == MAMBA_REPLAY_LAYOUT && mamba_replay_window)) {
+        LLAMA_LOG_ERROR("%s: incompatible recurrent cache layout %u\n", __func__, layout);
         return false;
     }
 
@@ -1307,28 +1327,40 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             uint64_t s_size_row_ref;
             io.read(&s_size_row_ref, sizeof(s_size_row_ref));
             const size_t s_size_row = s_l[il]->nb[1];
+            const auto & history = mamba_replay_l[il];
+            if (layout == 0 && history.x) {
+                // Older ReplaySSM saves interleaved x, dt, B records after each dense checkpoint.
+                if ((flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) ||
+                    s_size_row_ref != s_size_row + history.x->nb[1] + history.dt->nb[1] + history.b->nb[1] + sizeof(float)) {
+                    LLAMA_LOG_ERROR("%s: incompatible packed ReplaySSM row (layer %u)\n", __func__, il);
+                    return false;
+                }
+                for (uint32_t i = head; i < head + cell_count; ++i) {
+                    io.read_tensor(s_l[il], i*s_size_row, s_size_row);
+                    for (uint32_t j = 0; j < mamba_replay_window; ++j) {
+                        for (ggml_tensor * t : { history.x, history.dt, history.b }) {
+                            const size_t step = t->nb[1]/mamba_replay_window;
+                            io.read_tensor(t, i*t->nb[1] + j*step, step);
+                        }
+                    }
+                    float count;
+                    io.read(&count, sizeof(count));
+                    if (!(count >= 0 && count < mamba_replay_window && count == std::floor(count))) {
+                        LLAMA_LOG_ERROR("%s: invalid ReplaySSM history count (layer %u)\n", __func__, il);
+                        return false;
+                    }
+                    const int32_t n = (int32_t) count;
+                    ggml_backend_tensor_set(history.count, &n, i*sizeof(n), sizeof(n));
+                }
+                continue;
+            }
             if (s_size_row != s_size_row_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched s row size (%zu != %zu, layer %d)\n", __func__, s_size_row, (size_t) s_size_row_ref, il);
                 return false;
             }
 
             if (cell_count) {
-                if (s_l[il]->ne[0] != hparams.n_embd_s() && !(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
-                    const int64_t record_size = hparams.ssm_d_inner + hparams.ssm_dt_rank + int64_t(hparams.ssm_d_state)*hparams.ssm_n_group;
-                    const int64_t window = (s_l[il]->ne[0] - hparams.n_embd_s() - 1)/record_size;
-                    std::vector<float> row(s_l[il]->ne[0]);
-                    for (uint32_t i = 0; i < cell_count; ++i) {
-                        io.read(row.data(), s_size_row);
-                        const float count = row.back();
-                        if (!(count >= 0 && count < window && count == std::floor(count))) {
-                            LLAMA_LOG_ERROR("%s: invalid ReplaySSM history count (layer %u)\n", __func__, il);
-                            return false;
-                        }
-                        ggml_backend_tensor_set(s_l[il], row.data(), (head + i)*s_size_row, s_size_row);
-                    }
-                } else {
-                    io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
-                }
+                io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
             }
         }
     } else {
@@ -1375,9 +1407,9 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         }
     }
 
-    if (rs_replay) {
+    if (rs_replay || layout == MAMBA_REPLAY_LAYOUT) {
         for (uint32_t il = 0; il < n_layer; ++il) {
-            for (ggml_tensor * t : { spk_l[il], spv_l[il], spgb_l[il] }) {
+            for (ggml_tensor * t : pending_rows(il)) {
                 if (t == nullptr) continue;
 
                 uint64_t size_row_ref;
@@ -1387,7 +1419,17 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
                     return false;
                 }
 
-                if (cell_count) {
+                if (cell_count && t == mamba_replay_l[il].count && !(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+                    std::vector<int32_t> counts(cell_count);
+                    io.read(counts.data(), cell_count*sizeof(int32_t));
+                    for (int32_t count : counts) {
+                        if (count < 0 || (uint32_t) count >= mamba_replay_window) {
+                            LLAMA_LOG_ERROR("%s: invalid ReplaySSM history count (layer %u)\n", __func__, il);
+                            return false;
+                        }
+                    }
+                    ggml_backend_tensor_set(t, counts.data(), head*t->nb[1], counts.size()*sizeof(int32_t));
+                } else if (cell_count) {
                     io.read_tensor(t, head * t->nb[1], cell_count * t->nb[1]);
                 }
             }
@@ -1428,6 +1470,11 @@ void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head
         if (p_l[il] != nullptr) {
             const size_t p_size_row = p_l[il]->nb[1];
             ggml_backend_tensor_memset(p_l[il], 0, cell_head * p_size_row, cell_count * p_size_row);
+        }
+        for (ggml_tensor * t : pending_rows(il)) {
+            if (t) {
+                ggml_backend_tensor_memset(t, 0, cell_head*t->nb[1], cell_count*t->nb[1]);
+            }
         }
     }
 }
@@ -1526,6 +1573,10 @@ ggml_tensor * llama_memory_recurrent_context::get_spv_l(int32_t il) const {
 
 ggml_tensor * llama_memory_recurrent_context::get_spgb_l(int32_t il) const {
     return mem->spgb_l[il];
+}
+
+const llama_mamba_replay_cache & llama_memory_recurrent_context::get_mamba_replay(int32_t il) const {
+    return mem->mamba_replay_l[il];
 }
 
 bool llama_memory_recurrent_context::get_rs_replay() const {

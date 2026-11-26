@@ -35,6 +35,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <regex>
 #include <set>
@@ -5094,8 +5095,7 @@ struct test_ssm_scan : public test_case {
             C = ggml_new_tensor_4d(ctx, type, d_state,  n_group, n_seq_tokens, n_seqs);
         }
         ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,  n_seqs);
-        ggml_tensor * out = ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids, K);
-        return out;
+        return ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids, K);
     }
 
 
@@ -5144,6 +5144,9 @@ struct test_ssm_scan_replay : public test_case {
     ggml_tensor * B;
     ggml_tensor * C;
     ggml_tensor * ids;
+    ggml_tensor * x_cache;
+    ggml_tensor * dt_cache;
+    ggml_tensor * B_cache;
 
     test_ssm_scan_replay(int32_t window, int64_t d_state, int64_t head_dim, int64_t n_head,
                         int64_t n_group, int64_t n_seq_tokens, int64_t n_seqs, int32_t count,
@@ -5159,8 +5162,11 @@ struct test_ssm_scan_replay : public test_case {
     double max_nmse_err() override { return n_seq_tokens > 128 ? 2e-7 : 1e-7; }
 
     void build_inputs(ggml_context * ctx) {
-        const int64_t n_record = head_dim*n_head + n_head + d_state*n_group;
-        s   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_state*head_dim*n_head + window*n_record + 1, n_seqs);
+        const int64_t n_slots = n_seqs;
+        s        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_state*head_dim*n_head, n_slots);
+        x_cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, window*head_dim*n_head, n_slots);
+        dt_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, window*n_head, n_slots);
+        B_cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, window*d_state*n_group, n_slots);
         dt  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_head, n_seq_tokens, n_seqs);
         A   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_head);
         if (xbc_overlap) {
@@ -5176,74 +5182,70 @@ struct test_ssm_scan_replay : public test_case {
             B = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d_state, n_group, n_seq_tokens, n_seqs);
             C = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d_state, n_group, n_seq_tokens, n_seqs);
         }
-        ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
-        ggml_set_name(s, "replay_state");
+        ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_seqs, 2);
+        ggml_set_name(dt_cache, "replay_dt_cache");
         ggml_set_name(A, "replay_A");
         ggml_set_name(ids, "replay_ids");
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         build_inputs(ctx);
-        return ggml_ssm_scan_replay(ctx, s, x, dt, A, B, C, ids, window);
+        return ggml_ssm_scan_replay(ctx, s, x, dt, A, B, C, ids, x_cache, dt_cache, B_cache, window);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
+        const auto pending = [&](int64_t seq) {
+            return count >= 0 ? count : seq % 3 == 0 ? 0 : seq % 3 == 1 ? window / 2 : window - 1;
+        };
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (t->view_src != nullptr) {
                 continue;
             }
             if (t->type == GGML_TYPE_I32) {
                 std::vector<int32_t> data(ggml_nelements(t));
-                for (size_t i = 0; i < data.size(); ++i) {
-                    data[i] = strcmp(t->name, "replay_ids") == 0 ? data.size() - 1 - i : i;
-                }
-                if (shared_ids && strcmp(t->name, "replay_ids") == 0) {
-                    data.back() = data.front();
+                if (strcmp(t->name, "replay_ids") == 0) {
+                    for (int64_t i = 0; i < n_seqs; ++i) {
+                        data[i] = shared_ids && i == n_seqs - 1 ? n_seqs - 1 : n_seqs - 1 - i;
+                        data[n_seqs + i] = pending(data[i]);
+                    }
+                } else {
+                    std::iota(data.begin(), data.end(), 0);
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "replay_A") == 0) {
                 init_tensor_uniform(t, -0.1f, -0.01f);
+            } else if (strcmp(t->name, "replay_dt_cache") == 0) {
+                init_tensor_uniform(t, 0.4f, 0.6f);
             } else {
                 init_tensor_uniform(t, -0.125f, 0.125f);
-                if (strcmp(t->name, "replay_state") == 0) {
-                    const int64_t ni = head_dim*n_head;
-                    const int64_t n_state  = d_state*ni;
-                    const int64_t n_record = ni + n_head + d_state*n_group;
-                    std::vector<float> data(ggml_nelements(t));
-                    ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
-                    for (int64_t seq = 0; seq < n_seqs; ++seq) {
-                        float * row = data.data() + seq*t->ne[0];
-                        const int32_t pending = count >= 0 ? count : seq % 3 == 0 ? 0 : seq % 3 == 1 ? window / 2 : window - 1;
-                        for (int32_t j = 0; j < pending; ++j) {
-                            for (int64_t h = 0; h < n_head; ++h) {
-                                row[n_state + j*n_record + ni + h] = 0.5f + 0.01f*h;
-                            }
-                        }
-                        row[t->ne[0] - 1] = pending;
-                    }
-                    ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
-                }
             }
         }
     }
 };
 
-struct test_ssm_scan_replay_coefficient : public test_ssm_scan_replay {
-    ggml_tensor * expected;
-    static constexpr float raw_dt = 2.392912149f;
-
-    test_ssm_scan_replay_coefficient(int32_t window, int32_t count)
-        : test_ssm_scan_replay(window, 128, 64, 4, 2, 1, 1, count) {}
-
-    std::string op_desc(ggml_tensor *) override { return "SSM_SCAN_REPLAY_COEFFICIENT"; }
+// These graphs compute the error against a reference on each backend.
+struct test_ssm_scan_replay_error : public test_ssm_scan_replay {
+    using test_ssm_scan_replay::test_ssm_scan_replay;
     bool run_whole_graph() override { return true; }
     double max_err() override { return 1e-5; }
     double max_err(ggml_backend_t) override { return max_err(); }
     double err(const float * a, const float * b, size_t n) override {
         double result = 0;
-        for (size_t i = 0; i < n; ++i) { result = std::max(result, (double) std::max(fabsf(a[i]), fabsf(b[i]))); }
+        for (size_t i = 0; i < n; ++i) {
+            result = std::max(result, (double) std::max(fabsf(a[i]), fabsf(b[i])));
+        }
         return result;
     }
+};
+
+struct test_ssm_scan_replay_coefficient : public test_ssm_scan_replay_error {
+    ggml_tensor * expected;
+    static constexpr float raw_dt = 2.392912149f;
+
+    test_ssm_scan_replay_coefficient(int32_t window, int32_t count)
+        : test_ssm_scan_replay_error(window, 128, 64, 4, 2, 1, 1, count) {}
+
+    std::string op_desc(ggml_tensor *) override { return "SSM_SCAN_REPLAY_COEFFICIENT"; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * out = test_ssm_scan_replay::build_graph(ctx);
@@ -5255,7 +5257,7 @@ struct test_ssm_scan_replay_coefficient : public test_ssm_scan_replay {
         test_ssm_scan_replay::initialize_tensors(ctx);
         // captured model values: |A| is large, so a record only counts when the dt after it are tiny
         const float  A_head  = -52838.74609375f;
-        const float  raw_cur = count > 0 ? -14.0f : raw_dt;
+        const float  raw_cur = -14.0f;
         const double dt_rec  = std::log1p(std::exp((double) raw_dt));
         const double dt_cur  = std::log1p(std::exp((double) raw_cur));
         init_tensor_uniform(A, A_head, A_head);
@@ -5263,18 +5265,16 @@ struct test_ssm_scan_replay_coefficient : public test_ssm_scan_replay {
         init_tensor_uniform(x, 1.0f, 1.0f);
         init_tensor_uniform(B, 1.0f, 1.0f);
         init_tensor_uniform(C, 1.0f/d_state, 1.0f/d_state);
-        const int64_t ni = head_dim*n_head;
-        const int64_t n_record = ni + n_head + d_state*n_group;
         // the last three records are tiny as well, so the record before them still counts
         const auto dt_step = [&](int32_t j) { return j == count || (j > 0 && j >= count - 3) ? dt_cur : dt_rec; };
-        std::vector<float> state(ggml_nelements(s), 0.0f);
+        init_tensor_uniform(s, 0.0f, 0.0f);
+        init_tensor_uniform(x_cache, 1.0f, 1.0f);
+        init_tensor_uniform(B_cache, 1.0f, 1.0f);
+        std::vector<float> steps(ggml_nelements(dt_cache));
         for (int32_t j = 0; j < count; ++j) {
-            float * record = state.data() + d_state*ni + j*n_record;
-            std::fill(record, record + n_record, 1.0f); // x and B
-            std::fill(record + ni, record + ni + n_head, (float) dt_step(j));
+            std::fill_n(steps.data() + j*n_head, n_head, (float) dt_step(j));
         }
-        state.back() = count;
-        ggml_backend_tensor_set(s, state.data(), 0, ggml_nbytes(s));
+        ggml_backend_tensor_set(dt_cache, steps.data(), 0, ggml_nbytes(dt_cache));
         // every step, scaled by the decay over the dt after it
         double value = 0.0;
         double after = 0.0;
@@ -5286,32 +5286,21 @@ struct test_ssm_scan_replay_coefficient : public test_ssm_scan_replay {
     }
 };
 
-struct test_ssm_scan_replay_sequence : public test_ssm_scan_replay {
-    test_ssm_scan_replay_sequence(int32_t window, int64_t d_state, int64_t n_seqs)
-        : test_ssm_scan_replay(window, d_state, 32, 4, 2, 2*window + 11, n_seqs, 0) {}
+struct test_ssm_scan_replay_sequence : public test_ssm_scan_replay_error {
+    test_ssm_scan_replay_sequence(int32_t window, int64_t d_state, int64_t n_seqs,
+                                 int64_t n_group = 2, bool xbc_overlap = false)
+        : test_ssm_scan_replay_error(window, d_state, 32, 4, n_group, 2*window + 11, n_seqs, 0, xbc_overlap) {}
 
     std::string op_desc(ggml_tensor *) override { return "SSM_SCAN_REPLAY_SEQUENCE"; }
-    bool run_whole_graph() override { return true; }
     size_t max_tensors() override { return 32*n_seq_tokens; }
-    double max_err() override { return 1e-5; }
-    double max_err(ggml_backend_t) override { return max_err(); }
-
-    double err(const float * a, const float * b, size_t n) override {
-        double result = 0.0;
-        for (size_t i = 0; i < n; ++i) {
-            result = std::max(result, (double) fabsf(a[i]));
-            result = std::max(result, (double) fabsf(b[i]));
-        }
-        return result;
-    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         build_inputs(ctx);
         const int64_t n_state = d_state*head_dim*n_head;
         ggml_tensor * identity = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
-        ggml_tensor * packed = s;
-        ggml_tensor * state = ggml_reshape_4d(ctx, ggml_cont(ctx, ggml_view_2d(ctx, s, n_state, n_seqs, s->nb[1], 0)),
-                                             d_state, head_dim, n_head, n_seqs);
+        ggml_tensor * caches[] = { s, x_cache, dt_cache, B_cache };
+        ggml_tensor * ids_counts = ids;
+        ggml_tensor * state = ggml_reshape_4d(ctx, s, d_state, head_dim, n_head, n_seqs);
         ggml_tensor * error = nullptr;
         for (int64_t t = 0; t < n_seq_tokens;) {
             const int64_t nt = t == 0 || t == 2*window + 4 ? 3 : t == 2*window + 9 ? 2 : 1;
@@ -5319,21 +5308,27 @@ struct test_ssm_scan_replay_sequence : public test_ssm_scan_replay {
             ggml_tensor * bt = ggml_view_4d(ctx, B, d_state, n_group, nt, n_seqs, B->nb[1], B->nb[2], B->nb[3], t*B->nb[2]);
             ggml_tensor * ct = ggml_view_4d(ctx, C, d_state, n_group, nt, n_seqs, C->nb[1], C->nb[2], C->nb[3], t*C->nb[2]);
             ggml_tensor * dtt = ggml_cont(ctx, ggml_view_3d(ctx, dt, n_head, nt, n_seqs, dt->nb[1], dt->nb[2], t*dt->nb[1]));
-            ggml_tensor * seq_ids = t == 0 ? ids : identity;
-            ggml_tensor * replay = ggml_ssm_scan_replay(ctx, packed, xt, dtt, A, bt, ct, seq_ids, window);
+            ggml_tensor * seq_ids = ggml_view_1d(ctx, ids_counts, n_seqs, 0);
+            ggml_tensor * replay = ggml_ssm_scan_replay(ctx, caches[0], xt, dtt, A, bt, ct, ids_counts,
+                                                       caches[1], caches[2], caches[3], window);
             ggml_tensor * scan = ggml_ssm_scan(ctx, state, xt, dtt, A, bt, ct, seq_ids, 1);
             const int64_t n_y = ggml_nelements(xt);
             ggml_tensor * diff = ggml_sub(ctx, ggml_view_1d(ctx, replay, n_y, 0), ggml_view_1d(ctx, scan, n_y, 0));
             diff = ggml_sum(ctx, ggml_sqr(ctx, diff));
             error = error == nullptr ? diff : ggml_add(ctx, error, diff);
-            packed = ggml_view_2d(ctx, replay, s->ne[0], n_seqs, s->nb[1], n_y*sizeof(float));
+            size_t offset = n_y*sizeof(float);
+            for (ggml_tensor * & cache : caches) {
+                cache = ggml_view_2d(ctx, replay, cache->ne[0], n_seqs, cache->nb[1], offset);
+                offset += ggml_nbytes(cache);
+            }
+            ggml_tensor * counts = ggml_cast(ctx, ggml_view_1d(ctx, replay, n_seqs, offset), GGML_TYPE_I32);
+            ids_counts = ggml_concat(ctx, identity, counts, 1);
             state = ggml_view_4d(ctx, scan, d_state, head_dim, n_head, n_seqs,
                                 d_state*sizeof(float), d_state*head_dim*sizeof(float), n_state*sizeof(float), n_y*sizeof(float));
             t += nt;
         }
         // The final prefill materializes both states after several window boundaries.
-        ggml_tensor * checkpoint = ggml_cont(ctx, ggml_view_2d(ctx, packed, n_state, n_seqs, packed->nb[1], 0));
-        ggml_tensor * diff = ggml_sub(ctx, checkpoint, ggml_reshape_2d(ctx, state, n_state, n_seqs));
+        ggml_tensor * diff = ggml_sub(ctx, caches[0], ggml_reshape_2d(ctx, state, n_state, n_seqs));
         return ggml_add(ctx, error, ggml_sum(ctx, ggml_sqr(ctx, diff)));
     }
 };
@@ -12562,21 +12557,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 128, 2)); // SSD multi-chunk, no tail (exercises the chunk-to-chunk state handoff)
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 128, 2, false, /*K=*/1, /*weak_decay=*/true)); // SSD multi-chunk, carried state not numerically negligible
 
-    for (int32_t window : { 1, 2, 16, 32 }) {
-        test_cases.emplace_back(new test_ssm_scan_replay(window, 128, 64, 4, 2, 1, 2, 0));
-        if (window > 1) {
-            test_cases.emplace_back(new test_ssm_scan_replay(window, 128, 64, 4, 2, 1, 2, window - 1));
-        }
+    // Compare replay against the ordinary scan across window boundaries and a return to prefill.
+    for (int32_t window : { 1, 16, 32 }) {
+        test_cases.emplace_back(new test_ssm_scan_replay_sequence(window, 128, 2));
     }
-    test_cases.emplace_back(new test_ssm_scan_replay_sequence(16, 128, 2));
-    test_cases.emplace_back(new test_ssm_scan_replay(16, 96, 64, 8, 2, 1, 2, 7));
-    test_cases.emplace_back(new test_ssm_scan_replay(16, 256, 64, 4, 1, 1, 1, 15));
-    test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 32, 4, 2, 5, 2, 7));
-    test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 80, 8, 2, 1, 2, 7));
+    test_cases.emplace_back(new test_ssm_scan_replay_sequence(4, 96, 1, 1, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_sequence(8, 256, 4, 4, true));
     test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 80, 8, 2, 300, 2, 7));
     test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 16, 16, 8, 1, 4, -1, true, true));
-    test_cases.emplace_back(new test_ssm_scan_replay_coefficient(1, 0));
-    test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 0));
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 1));
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 15));
 
@@ -15105,6 +15093,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 512, 1)); // Nemotron-9B prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 1,   1)); // Nemotron-9B generate
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 96, 8, 1, 1)); // Nemotron-3-Nano-4B
+    for (int32_t count : { 0, 7, 15 }) {
+        test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 80, 96, 8, 1, 1, count));
+    }
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 512, 1));	// Mamba-2 prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2,   1, 1));	// Mamba-2 generate

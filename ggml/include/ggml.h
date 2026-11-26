@@ -2327,8 +2327,9 @@ extern "C" {
             int64_t               K);
 
     // SSM_SCAN with an F32 Mamba-2 checkpoint and a replay window, 1 <= window <= 32.
-    // Each row of s contains the checkpoint, window records [x, softplus(dt), B], and a record count.
-    // Returns contiguous x-shaped outputs followed by the updated packed rows selected by ids.
+    // s holds dense checkpoints. Each history has one row per checkpoint slot with window successive feature vectors.
+    // ids_counts is I32 [n_seqs, 2]: source slot IDs, then their pending counts in active-sequence order.
+    // Returns contiguous F32 segments for y, s, x_cache, dt_cache, B_cache and counts, each in active-sequence order.
     // Multi-token calls materialize pending inputs and clear the replay window. No rollback snapshots are returned.
     GGML_API struct ggml_tensor * ggml_ssm_scan_replay(
             struct ggml_context * ctx,
@@ -2338,7 +2339,10 @@ extern "C" {
             struct ggml_tensor  * A,
             struct ggml_tensor  * B,
             struct ggml_tensor  * C,
-            struct ggml_tensor  * ids,
+            struct ggml_tensor  * ids_counts,
+            struct ggml_tensor  * x_cache,
+            struct ggml_tensor  * dt_cache,
+            struct ggml_tensor  * B_cache,
             int32_t               window);
 
     // partition into non-overlapping windows with padding if needed

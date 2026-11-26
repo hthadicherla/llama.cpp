@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-memory.h"
 
+#include <array>
 #include <map>
 #include <set>
 #include <vector>
@@ -11,6 +12,13 @@
 //
 // llama_memory_recurrent
 //
+
+struct llama_mamba_replay_cache {
+    ggml_tensor * x     = nullptr;
+    ggml_tensor * dt    = nullptr;
+    ggml_tensor * b     = nullptr;
+    ggml_tensor * count = nullptr;
+};
 
 // TODO: extract the cache state used for graph computation into llama_memory_recurrent_context_i
 //       see the implementation of llama_kv_cache_context_i for an example how to do it
@@ -131,12 +139,14 @@ public:
     std::vector<ggml_tensor *> spk_l;
     std::vector<ggml_tensor *> spv_l;
     std::vector<ggml_tensor *> spgb_l;
+    std::vector<llama_mamba_replay_cache> mamba_replay_l;
 
 private:
     //const llama_model & model;
     const llama_hparams & hparams;
 
     const uint32_t n_seq_max = 1;
+    uint32_t mamba_replay_window = 0;
 
     // ggml contexts for the RS cache along with the allocated backend buffers:
     llama_memory_bufs ctxs_bufs;
@@ -149,6 +159,7 @@ private:
     size_t size_r_bytes() const;
     size_t size_s_bytes() const;
     size_t size_p_bytes() const;
+    std::array<ggml_tensor *, 4> pending_rows(uint32_t il) const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
@@ -201,6 +212,7 @@ public:
     ggml_tensor * get_spk_l (int32_t il) const;
     ggml_tensor * get_spv_l (int32_t il) const;
     ggml_tensor * get_spgb_l(int32_t il) const;
+    const llama_mamba_replay_cache & get_mamba_replay(int32_t il) const;
 
     int32_t s_copy(int i) const;
 

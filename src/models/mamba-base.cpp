@@ -149,6 +149,65 @@ ggml_tensor * llm_build_mamba_base::build_mamba_layer(llm_graph_input_rs * inp,
     return cur;
 }
 
+static ggml_tensor * build_mamba2_replay(ggml_context * ctx0, ggml_cgraph * gf, llm_graph_input_rs * inp, int il,
+                                         ggml_tensor * x, ggml_tensor * dt, ggml_tensor * A, ggml_tensor * B, ggml_tensor * C,
+                                         uint32_t window) {
+    const auto * mctx = inp->mctx;
+    const auto & history = mctx->get_mamba_replay(il);
+    auto * checkpoint = mctx->get_s_l(il);
+    const int64_t n_seqs = x->ne[3];
+    const int64_t n_extra = mctx->get_n_rs() - n_seqs;
+    const int64_t head = mctx->get_head();
+    const int32_t zero = mctx->get_rs_z();
+
+    struct {
+        ggml_tensor * cache;
+        ggml_tensor * extra;
+    } fields[] = {{checkpoint, nullptr}, {history.x, nullptr}, {history.dt, nullptr},
+                  {history.b, nullptr}, {history.count, nullptr}};
+
+    // Read every inactive source before any active destination can overwrite it.
+    for (auto & field : fields) {
+        auto * cache = field.cache;
+        if (zero >= 0) {
+            auto * row = ggml_view_1d(ctx0, cache, cache->ne[0], zero*cache->nb[1]);
+            auto * clear = cache == history.count ? ggml_cpy(ctx0, ggml_arange(ctx0, 0, 1, 1), row)
+                                                  : ggml_fill_inplace(ctx0, row, 0);
+            ggml_build_forward_expand(gf, clear);
+        }
+        if (inp->s_copy_tail->ne[0] > 0) {
+            field.extra = ggml_get_rows(ctx0, cache, inp->s_copy_tail);
+            ggml_build_forward_expand(gf, field.extra);
+        }
+    }
+
+    auto * ids = inp->s_copy_main;
+    auto * counts = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, history.count, ids), n_seqs);
+    auto * ids_counts = ggml_concat(ctx0, ids, counts, 1);
+    auto * out = ggml_ssm_scan_replay(ctx0, checkpoint, x, dt, A, B, C, ids_counts,
+                                     history.x, history.dt, history.b, window);
+
+    size_t offset = ggml_nelements(x)*ggml_element_size(out);
+    for (const auto & field : fields) {
+        auto * cache = field.cache;
+        const size_t stride = ggml_row_size(out->type, cache->ne[0]);
+        auto * src = ggml_view_2d(ctx0, out, cache->ne[0], n_seqs, stride, offset);
+        auto * dst = ggml_view_2d(ctx0, cache, cache->ne[0], n_seqs, cache->nb[1], head*cache->nb[1]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        offset += stride*n_seqs;
+    }
+    if (n_extra > 0) {
+        for (const auto & field : fields) {
+            auto * cache = field.cache;
+            auto * src = ggml_view_2d(ctx0, field.extra, cache->ne[0], n_extra, field.extra->nb[1],
+                                      (field.extra->ne[1] - n_extra)*field.extra->nb[1]);
+            auto * dst = ggml_view_2d(ctx0, cache, cache->ne[0], n_extra, cache->nb[1], (head + n_seqs)*cache->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        }
+    }
+    return out;
+}
+
 ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
                                                           ggml_tensor *        cur,
                                                           const llama_ubatch & ubatch,
@@ -242,10 +301,6 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         // (this is necessary in order to properly use the states before they are overwritten,
         //  while avoiding to make unnecessary copies of the states)
         auto get_ssm_rows = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
-            if (states->ne[0] != hparams.n_embd_s()) {
-                GGML_ASSERT(K == 1);
-                return ggml_ssm_scan_replay(ctx, states, x, dt, A, B, C, ids, cparams.ssm_replay_window);
-            }
             ggml_tensor * ssm = ggml_reshape_4d(ctx, states, d_state, head_dim, n_head, state_slots);
 
             // TODO: use semistructured matrices to implement state-space duality
@@ -254,19 +309,24 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
             return ggml_ssm_scan(ctx, ssm, x, dt, A, B, C, ids, K);
         };
 
-        ggml_tensor * y_ssm = build_rs(inp, ssm_states_all, ssm_states_all->ne[0], ubatch.n_seqs, get_ssm_rows);
-        const int64_t D            = ssm_states_all->ne[0];
-        const int64_t n_written    = std::min<int64_t>(n_seq_tokens, K);
-        const size_t  row_size     = ggml_row_size(ssm_states_all->type, D);
-        const size_t  y_row_size   = ggml_row_size(y_ssm->type, D);
-        const size_t  state_offset = ggml_nelements(x) * ggml_element_size(x);
+        ggml_tensor * y_ssm;
+        if (mctx_cur->get_mamba_replay(il).x) {
+            y_ssm = build_mamba2_replay(ctx0, gf, inp, il, x, dt, A, B, C, cparams.ssm_replay_window);
+        } else {
+            y_ssm = build_rs(inp, ssm_states_all, ssm_states_all->ne[0], ubatch.n_seqs, get_ssm_rows);
+            const int64_t D            = ssm_states_all->ne[0];
+            const int64_t n_written    = std::min<int64_t>(n_seq_tokens, K);
+            const size_t  row_size     = ggml_row_size(ssm_states_all->type, D);
+            const size_t  y_row_size   = ggml_row_size(y_ssm->type, D);
+            const size_t  state_offset = ggml_nelements(x) * ggml_element_size(x);
 
-        ggml_build_forward_expand(
-            gf, ggml_cpy(ctx0,
-                         ggml_view_3d(ctx0, y_ssm, D, n_seqs, n_written,
-                                      y_row_size, y_row_size * n_seqs, state_offset),
-                         ggml_view_3d(ctx0, ssm_states_all, D, n_seqs, n_written,
-                                      ssm_states_all->nb[1], (size_t) mem_size * row_size, kv_head * row_size)));
+            ggml_build_forward_expand(
+                gf, ggml_cpy(ctx0,
+                             ggml_view_3d(ctx0, y_ssm, D, n_seqs, n_written,
+                                          y_row_size, y_row_size * n_seqs, state_offset),
+                             ggml_view_3d(ctx0, ssm_states_all, D, n_seqs, n_written,
+                                          ssm_states_all->nb[1], (size_t) mem_size * row_size, kv_head * row_size)));
+        }
 
         ggml_tensor * y = ggml_view_4d(ctx0, y_ssm, head_dim, n_head, n_seq_tokens, n_seqs, x->nb[1], n_head * x->nb[1],
                                        n_seq_tokens * n_head * x->nb[1], 0);

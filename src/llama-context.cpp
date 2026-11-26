@@ -2925,6 +2925,11 @@ uint32_t llama_context::graph_max_nodes() const {
         res += 32u*model.hparams.n_layer_all;
     }
 
+    // Replay has four extra cache rows per layer, each with clear, gather and copy views.
+    if (cparams.ssm_replay_window > 0 && model.hparams.ssm_n_group > 0) {
+        res += 48u*model.hparams.n_layer_all;
+    }
+
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
     for (const auto & [seq_id, sampler] : sampling.samplers) {
         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
