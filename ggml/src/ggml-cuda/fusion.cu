@@ -581,7 +581,8 @@ static int ggml_cuda_try_ssm_scan_cache_fusion(
     const int64_t n_seqs  = x->ne[3];
 
     // only the mamba-2 kernels (group scan and SSD) write to the cache; mamba-1 still uses the cpy
-    if (A->nb[1] != sizeof(float) || (d_state != 96 && d_state != 128 && d_state != 256)) {
+    if (A->nb[1] != sizeof(float) ||
+        (d_state != 96 && d_state != 128 && d_state != 256 && !(replay && d_state == 64))) {
         return 0;
     }
 
