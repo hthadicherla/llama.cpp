@@ -5950,10 +5950,10 @@ struct test_ssm_scan_replay_cache : public test_ssm_scan_replay {
     const bool read_tail;
     const bool read_history;
 
-    test_ssm_scan_replay_cache(int32_t count, bool read_tail = false, int64_t n_tokens = 1,
+    test_ssm_scan_replay_cache(int64_t d_state, int32_t count, bool read_tail = false, int64_t n_tokens = 1,
                                int64_t head_dim = 64, int64_t n_head = 4, int64_t n_group = 2, int64_t n_seqs = 1,
                                bool xbc_overlap = false, bool shared_ids = false, bool read_history = false)
-        : test_ssm_scan_replay(16, 128, head_dim, n_head, n_group, n_tokens, n_seqs, count, xbc_overlap, shared_ids),
+        : test_ssm_scan_replay(16, d_state, head_dim, n_head, n_group, n_tokens, n_seqs, count, xbc_overlap, shared_ids),
           read_tail(read_tail), read_history(read_history) {}
 
     std::string op_desc(ggml_tensor *) override { return read_tail || read_history ? "SSM_SCAN_REPLAY_CACHE_TAIL" : "SSM_SCAN_REPLAY_CACHE"; }
@@ -13580,13 +13580,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 1));
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 15));
     // The copy fusion must preserve external readers, shared rows and overlapping inputs.
-    test_cases.emplace_back(new test_ssm_scan_replay_cache(7));
-    test_cases.emplace_back(new test_ssm_scan_replay_cache(7, true));
-    test_cases.emplace_back(new test_ssm_scan_replay_cache(7, false, 300));
-    test_cases.emplace_back(new test_ssm_scan_replay_cache(15, false, 1, 64, 4, 2, 3));
-    test_cases.emplace_back(new test_ssm_scan_replay_cache(-1, false, 1, 32, 8, 1, 4, true, true));
-    test_cases.emplace_back(new test_ssm_scan_replay_cache(7, false, 1, 64, 4, 2, 1, false, false, true));
-    auto * alias = new test_ssm_scan_replay_cache(7);
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(128, 7));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(128, 7, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(128, 7, false, 300));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(64, 7, false, 300));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(64, 15, false, 1, 64, 4, 2, 3));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(128, -1, false, 1, 32, 8, 1, 4, true, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(128, 7, false, 1, 64, 4, 2, 1, false, false, true));
+    auto * alias = new test_ssm_scan_replay_cache(128, 7);
     alias->alias_checkpoint = true;
     test_cases.emplace_back(alias);
 
