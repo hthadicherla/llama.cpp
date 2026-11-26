@@ -2457,7 +2457,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (value < 1 || value > 32) {
                 throw std::invalid_argument("ReplaySSM window must be between 1 and 32");
             }
-            params.replayssm_buffer_len = value;
+            params.replayssm_buffer_len = (uint16_t) value;
         }
     ));
     add_opt(common_arg(
