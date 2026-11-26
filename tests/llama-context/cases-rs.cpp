@@ -236,6 +236,14 @@ struct case_mamba_replay : ctx_test {
                 CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx), s, keep, -1), "rollback failed");
                 batch.add(gen_token(n_vocab, s, keep + 1), keep, s, true);
             }
+            if (ctx == replay.get()) {
+                const auto flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+                std::vector<uint8_t> short_prefix, long_prefix;
+                CTX_REQUIRE(get_seq_state(ctx, 0, flags, short_prefix) && get_seq_state(ctx, 1, flags, long_prefix), "could not save the two prefixes");
+                CTX_REQUIRE(short_prefix.size() < long_prefix.size(), "the shorter prefix must use fewer bytes");
+                CTX_REQUIRE(set_seq_state(ctx, 0, flags, long_prefix) && set_seq_state(ctx, 0, flags, short_prefix) &&
+                            set_seq_state(ctx, 1, flags, long_prefix), "could not restore the pending prefixes");
+            }
             CTX_REQUIRE(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "continuation failed");
         }
         for (int i = 0; i < 2; ++i) {
