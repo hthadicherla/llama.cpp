@@ -233,6 +233,7 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_verify(llm_graph_input_rs * inp
                             state->nb[1], state->nb[2], state->nb[3], ggml_nbytes(px));
     };
     auto * committed = build_rs(inp, s, s->ne[0], n_seqs, replay);
+    // Full lengths keep long prompts on the same sequential scan as rollback with state snapshots.
     auto * scan = ggml_ssm_scan(ctx0, committed, x, dt, A, B, C, inp->seq_ids, 1);
     ggml_build_forward_expand(gf, scan);
 
