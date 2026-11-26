@@ -196,7 +196,8 @@ static ggml_tensor * build_mamba2_replay(ggml_context * ctx0, ggml_cgraph * gf, 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
         offset += stride*n_seqs;
     }
-    if (n_extra > 0) {
+    // The reserve graph gathers the worst-case tail. Keep its last use even when the copy has zero rows.
+    if (inp->s_copy_tail->ne[0] > 0) {
         for (const auto & field : fields) {
             auto * cache = field.cache;
             auto * src = ggml_view_2d(ctx0, field.extra, cache->ne[0], n_extra, field.extra->nb[1],

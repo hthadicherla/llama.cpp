@@ -13572,6 +13572,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int32_t window : { 1, 16, 32 }) {
         test_cases.emplace_back(new test_ssm_scan_replay_sequence(window, 128, 2));
     }
+    test_cases.emplace_back(new test_ssm_scan_replay_sequence(4, 64, 2));
     test_cases.emplace_back(new test_ssm_scan_replay_sequence(4, 96, 1, 1, true));
     test_cases.emplace_back(new test_ssm_scan_replay_sequence(8, 256, 4, 4, true));
     test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 80, 8, 2, 300, 2, 7));
