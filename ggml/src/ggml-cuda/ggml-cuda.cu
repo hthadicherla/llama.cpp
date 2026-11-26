@@ -4441,9 +4441,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 
             if (op->src[3]->ne[0] == 1) {
                 // Mamba2
-                // Only the ordinary scan supports d_state == 64.
                 const int64_t d_state = op->src[4]->ne[0];
-                return ((window == 0 && d_state == 64) || d_state == 96 || d_state == 128 || d_state == 256) && op->src[1]->ne[0] % 16 == 0;
+                return (d_state == 64 || d_state == 96 || d_state == 128 || d_state == 256) && op->src[1]->ne[0] % 16 == 0;
             } else {
                 if (K > 1) {
                     return false;

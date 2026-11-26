@@ -900,7 +900,7 @@ static void ggml_cuda_op_ssm_scan_impl(ggml_backend_cuda_context & ctx, ggml_ten
 
 struct ssm_replay_params {
     int64_t d_state, head_dim, n_head, n_group, window, slots;
-    int64_t s_stride, x_head, x_seq, dt_seq, A_head, B_group, B_seq, C_group, C_seq;
+    int64_t x_seq, dt_seq, B_seq, C_seq; // the first two dimensions of x, B and C are contiguous
     int64_t history_off[4]; // x, dt, B column offsets and total width per token
 };
 
@@ -930,9 +930,9 @@ static __global__ void ssm_replay_precompute(
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
     const int64_t first = ids[seq] * p.window;
-    const float * q = C + seq * p.C_seq + group * p.C_group;
+    const float * q = C + seq * p.C_seq + group * p.d_state;
     for (int j = warp; j <= count; j += blockDim.x / WARP_SIZE) {
-        const float * key = j == count ? B + seq * p.B_seq + group * p.B_group :
+        const float * key = j == count ? B + seq * p.B_seq + group * p.d_state :
             B_history + ((first + j) * p.n_group + group) * p.d_state;
         float dot = 0.0f;
         for (int i = lane; i < p.d_state; i += WARP_SIZE) {
@@ -963,16 +963,16 @@ static __global__ void ssm_replay_scan(
     const int64_t D = p.d_state * inner;
     const int count = ssm_replay_count(ids, seq, p);
     const int64_t first = ids[seq] * p.window;
-    const float * src = s + ids[seq] * p.s_stride;
+    const float * src = s + ids[seq] * D;
     float * dst = out + seq * D;
     if (materialize && blockIdx.x == 0 && threadIdx.x == 0) {
         identity[seq] = seq;
     }
     const int n_steps = materialize ? count : count + 1;
     const bool flush = materialize || n_steps == p.window;
-    const float * q = C + seq * p.C_seq + group * p.C_group;
-    const float * k = B + seq * p.B_seq + group * p.B_group;
-    const float * v = x + seq * p.x_seq + head * p.x_head;
+    const float * q = C + seq * p.C_seq + group * p.d_state;
+    const float * k = B + seq * p.B_seq + group * p.d_state;
+    const float * v = x + seq * p.x_seq + head * p.head_dim;
 
     __shared__ float scale[WARP_SIZE];
     __shared__ float total_decay;
@@ -988,7 +988,7 @@ static __global__ void ssm_replay_scan(
         }
         const float prefix = warp_prefix_inclusive_sum(step);
         const float below  = ggml_cuda_shfl_up(prefix, 1, WARP_SIZE);
-        const float a = A[head * p.A_head];
+        const float a = A[head];
         if (j >= 0) {
             scale[j] = step * expf(a * (lane == 0 ? 0.0f : below));
         }
@@ -1052,6 +1052,12 @@ static __global__ void ssm_replay_scan(
     }
 }
 
+// Keep kernel arguments in parameter memory: a dynamic index can copy the whole struct to each thread's stack.
+template <typename T>
+static __device__ __forceinline__ T ssm_replay_field(int field, T x, T dt, T B) {
+    return field == 0 ? x : field == 1 ? dt : B;
+}
+
 static __global__ void ssm_replay_store(
         const float * x, const float * dt, const float * B, const int32_t * ids,
         const ssm_replay_history history, float * out, ggml_cuda_ssm_scan_fused_cache cache, const ssm_replay_params p) {
@@ -1059,11 +1065,12 @@ static __global__ void ssm_replay_store(
     const int count = ssm_replay_count(ids, seq, p);
     const bool flush = count + 1 == p.window;
     const int field = blockIdx.z;
-    const int64_t offset = p.history_off[field];
-    const int64_t width = p.history_off[field + 1] - offset;
+    const int64_t offset = ssm_replay_field(field, p.history_off[0], p.history_off[1], p.history_off[2]);
+    const int64_t width = ssm_replay_field(field, p.history_off[1], p.history_off[2], p.history_off[3]) - offset;
     const int64_t row = width * p.window;
-    const float * src = (field == 0 ? history.x : field == 1 ? history.dt : history.B) + ids[seq] * row;
-    float * target = cache.history[field] ? cache.history[field] + seq * row : nullptr;
+    const float * src = ssm_replay_field(field, history.x, history.dt, history.B) + ids[seq] * row;
+    float * target = ssm_replay_field(field, cache.history[0], cache.history[1], cache.history[2]);
+    target = target ? target + seq * row : nullptr;
     float * dst = gridDim.y == 1 && target ? target : out + offset * p.window * gridDim.y + seq * row;
     const bool append = src == target && !flush;
     const int64_t begin = append ? count * width : 0;
@@ -1076,12 +1083,12 @@ static __global__ void ssm_replay_store(
         } else {
             const int64_t j = i - count * width;
             if (field == 0) {
-                dst[i] = x[seq * p.x_seq + (j / p.head_dim) * p.x_head + j % p.head_dim];
+                dst[i] = x[seq * p.x_seq + j];
             } else if (field == 1) {
                 const float val = dt[seq * p.dt_seq + j];
                 dst[i] = val <= 20.0f ? log1pf(expf(val)) : val;
             } else {
-                dst[i] = B[seq * p.B_seq + (j / p.d_state) * p.B_group + j % p.d_state];
+                dst[i] = B[seq * p.B_seq + j];
             }
         }
     }
@@ -1096,7 +1103,7 @@ static __global__ void ssm_replay_commit(
     const int seq = blockIdx.y;
     const int count = ids[gridDim.y + seq];
     const int64_t D = p.d_state * p.head_dim * p.n_head;
-    const bool append = count + 1 != p.window && s + ids[seq] * p.s_stride == cache.data + seq * D;
+    const bool append = count + 1 != p.window && s + ids[seq] * D == cache.data + seq * D;
     const float * src = staged + seq * D;
     float * dst = cache.data + seq * D;
     int64_t begin = 0, end = D;
@@ -1106,10 +1113,10 @@ static __global__ void ssm_replay_commit(
         }
     } else {
         const int field = blockIdx.z - 1;
-        const int64_t offset = p.history_off[field];
-        const int64_t width = p.history_off[field + 1] - offset;
+        const int64_t offset = ssm_replay_field(field, p.history_off[0], p.history_off[1], p.history_off[2]);
+        const int64_t width = ssm_replay_field(field, p.history_off[1], p.history_off[2], p.history_off[3]) - offset;
         src = staged + (D + offset * p.window) * gridDim.y + seq * width * p.window;
-        dst = cache.history[field] + seq * width * p.window;
+        dst = ssm_replay_field(field, cache.history[0], cache.history[1], cache.history[2]) + seq * width * p.window;
         begin = append ? count * width : 0;
         end = append ? begin + width : width * p.window;
     }
@@ -1137,10 +1144,8 @@ static void ggml_cuda_op_ssm_scan_replay(ggml_backend_cuda_context & ctx, ggml_t
     const int64_t n_y = ggml_nelements(x);
     const ssm_replay_params p = {
         B->ne[0], x->ne[0], x->ne[1], B->ne[1], ggml_get_op_params_i32(dst, 1), s->ne[1],
-        (int64_t) (s->nb[1] / sizeof(float)), (int64_t) (x->nb[1] / sizeof(float)), (int64_t) (x->nb[3] / sizeof(float)),
-        (int64_t) (dt->nb[2] / sizeof(float)), (int64_t) (A->nb[1] / sizeof(float)),
-        (int64_t) (B->nb[1] / sizeof(float)), (int64_t) (B->nb[3] / sizeof(float)),
-        (int64_t) (C->nb[1] / sizeof(float)), (int64_t) (C->nb[3] / sizeof(float)),
+        (int64_t) (x->nb[3] / sizeof(float)), (int64_t) (dt->nb[2] / sizeof(float)),
+        (int64_t) (B->nb[3] / sizeof(float)), (int64_t) (C->nb[3] / sizeof(float)),
         { 0, inner, inner + x->ne[1], inner + x->ne[1] + B->ne[0] * B->ne[1] },
     };
     cudaStream_t stream = ctx.stream();
@@ -1164,8 +1169,9 @@ static void ggml_cuda_op_ssm_scan_replay(ggml_backend_cuda_context & ctx, ggml_t
         CUDA_CHECK(cudaGetLastError());
     }
     const dim3 blocks(p.n_head * ((p.head_dim + threads / WARP_SIZE - 1) / (threads / WARP_SIZE)), n_seq);
-    GGML_ASSERT(p.d_state == 96 || p.d_state == 128 || p.d_state == 256);
-    const auto kernel = p.d_state == 96  ? ssm_replay_scan<96>  :
+    GGML_ASSERT(p.d_state == 64 || p.d_state == 96 || p.d_state == 128 || p.d_state == 256);
+    const auto kernel = p.d_state == 64  ? ssm_replay_scan<64>  :
+                        p.d_state == 96  ? ssm_replay_scan<96>  :
                         p.d_state == 128 ? ssm_replay_scan<128> : ssm_replay_scan<256>;
     kernel<<<blocks, threads, 0, stream>>>(
         (const float *) s->data, (const float *) x->data, (const float *) dt->data, (const float *) A->data,
