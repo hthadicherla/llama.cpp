@@ -2123,6 +2123,9 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
         break;
     }
     case GGML_OP_SSM_SCAN: {
+        if (op->op_params[1] != 0) {
+            return {false, "SSM_SCAN with replay is not supported"};
+        }
         // SelectiveSSM implements the Mamba-2 recurrence: scalar decay per head, one final state
         if (op->src[3]->ne[0] != 1) {
             return {false, "SSM_SCAN with Mamba-1 state-wise decay is not supported"};

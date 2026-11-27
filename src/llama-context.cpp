@@ -198,6 +198,15 @@ llama_context::llama_context(
             model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_KIMI_K31 || model.arch == LLM_ARCH_GLM5_NEXT ||
             model.arch == LLM_ARCH_BAILINGMOE3 || model.arch == LLM_ARCH_RAON1_MINI);
 
+    cparams.ssm_replay_window = params.ssm_replay_window;
+    if (cparams.ssm_replay_window > 32) {
+        throw std::runtime_error("ssm_replay_window must be between 0 and 32");
+    }
+    if (cparams.ssm_replay_window > 0 && cparams.n_rs_seq > 0) {
+        LLAMA_LOG_WARN("%s: ReplaySSM disabled with recurrent-state rollback\n", __func__);
+        cparams.ssm_replay_window = 0;
+    }
+
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
@@ -2916,6 +2925,11 @@ uint32_t llama_context::graph_max_nodes() const {
         res += 32u*model.hparams.n_layer_all;
     }
 
+    // Replay has four extra cache rows per layer, each with clear, gather and copy views.
+    if (cparams.ssm_replay_window > 0 && model.hparams.ssm_n_group > 0) {
+        res += 48u*model.hparams.n_layer_all;
+    }
+
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
     for (const auto & [seq_id, sampler] : sampling.samplers) {
         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
@@ -4442,6 +4456,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.ssm_replay_window           =*/ 0,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

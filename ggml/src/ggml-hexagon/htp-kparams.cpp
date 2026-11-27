@@ -2831,7 +2831,7 @@ static bool htp_kparams_solve_ssm_scan(
     const struct ggml_tensor * op,
     struct htp_ssm_scan_kernel_params * kparams
 ) {
-    if (opt_ssm_select < 1) {
+    if (opt_ssm_select < 1 || ggml_get_op_params_i32(op, 1) != 0) {
         return false;
     }
 

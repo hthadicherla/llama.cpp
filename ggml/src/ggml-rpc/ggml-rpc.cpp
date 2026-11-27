@@ -2818,7 +2818,9 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
+    if (op->op == GGML_OP_SSM_SCAN && ggml_get_op_params_i32(op, 1) != 0) {
+        return false;
+    }
     //TODO: call the remote backend and cache the results
     return true;
 }

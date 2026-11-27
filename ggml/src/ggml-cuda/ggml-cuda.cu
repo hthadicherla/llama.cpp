@@ -3039,6 +3039,12 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
 
+        // Replay fusion may change when a different graph split also reads this tensor.
+        const ggml_tensor * base = ggml_cuda_view_base(cgraph->nodes[i]);
+        if (base->op == GGML_OP_SSM_SCAN && ggml_get_op_params_i32(base, 1) > 0) {
+            prop.replay_uses = ggml_node_get_use_count(cgraph, i);
+        }
+
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (cgraph->nodes[i]->src[j]) {
                 prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
@@ -4412,12 +4418,31 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    (op->type         == GGML_TYPE_F32 || op->type         == GGML_TYPE_F16);
         case GGML_OP_SSM_SCAN: {
             const int32_t K = ggml_get_op_params_i32(op, 0);
+            const int32_t window = ggml_get_op_params_i32(op, 1);
+            if (window != 0) {
+                if (K != 1 || window < 1 || window > 32 || op->src[3]->ne[0] != 1 ||
+                    op->type != GGML_TYPE_F32 || op->src[6]->type != GGML_TYPE_I32) {
+                    return false;
+                }
+                for (int i = 0; i < 6; ++i) {
+                    if (op->src[i]->type != GGML_TYPE_F32 || op->src[i]->nb[0] != sizeof(float)) {
+                        return false;
+                    }
+                }
+                if (op->src[6]->ne[1] != 2 || !ggml_is_contiguous(op->src[6])) {
+                    return false;
+                }
+                for (int i = 7; i <= 9; ++i) {
+                    if (!op->src[i] || op->src[i]->type != GGML_TYPE_F32 || !ggml_is_contiguous(op->src[i])) {
+                        return false;
+                    }
+                }
+            }
 
             if (op->src[3]->ne[0] == 1) {
                 // Mamba2
-                // (kernel only supports (d_state == 64 || d_state == 96 || d_state == 128 || d_state == 256) && d_head % 16 == 0)
-                const int64_t d_state = op->src[0]->ne[0];
-                return (d_state == 64 || d_state == 96 || d_state == 128 || d_state == 256) && op->src[0]->ne[1] % 16 == 0;
+                const int64_t d_state = op->src[4]->ne[0];
+                return (d_state == 64 || d_state == 96 || d_state == 128 || d_state == 256) && op->src[1]->ne[0] % 16 == 0;
             } else {
                 if (K > 1) {
                     return false;

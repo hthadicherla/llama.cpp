@@ -34,6 +34,9 @@ static bool ggml_backend_remoting_device_supports_op(ggml_backend_dev_t dev, con
         return false;
     }
 
+    if (op->op == GGML_OP_SSM_SCAN && ggml_get_op_params_i32(op, 1) != 0) {
+        return false;
+    }
     if ((op->op == GGML_OP_ROPE || op->op == GGML_OP_ROPE_BACK) &&
         !ggml_rope_get_truncate(op)) {
         return false;

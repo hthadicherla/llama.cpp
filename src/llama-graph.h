@@ -321,7 +321,7 @@ public:
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main; // I32 [n_seqs]
-    ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
+    ggml_tensor * s_copy_tail; // I32 [n_rs - n_seqs], or [n_rs - 1] in the reserve graph
 
     // rs_replay: the ubatch first replays the kept pending tokens of the last ubatch (none is a no-op)
     bool          has_rep  = false;

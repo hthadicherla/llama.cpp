@@ -35,6 +35,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <regex>
 #include <set>
@@ -1359,6 +1360,7 @@ struct test_case {
         ggml_backend_tensor_get(t2, t2_data.data(), 0, ggml_nbytes(t2));
         return t1_data == t2_data;
     }
+    virtual size_t max_tensors() { return 128; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
 
@@ -1453,7 +1455,7 @@ struct test_case {
         mode = MODE_TEST;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
+            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + ggml_graph_overhead(),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -1669,7 +1671,7 @@ struct test_case {
         static const size_t graph_nodes = 8192;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + ggml_graph_overhead_custom(graph_nodes, false),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -1819,7 +1821,7 @@ struct test_case {
         static const size_t graph_nodes = 8192;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + ggml_graph_overhead_custom(graph_nodes, false),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -1853,7 +1855,7 @@ struct test_case {
         const std::vector<float> expect = grad_expect();
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + 2*ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true),
+            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + 2*ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -5702,8 +5704,7 @@ struct test_ssm_scan : public test_case {
             C = ggml_new_tensor_4d(ctx, type, d_state,  n_group, n_seq_tokens, n_seqs);
         }
         ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,  n_seqs);
-        ggml_tensor * out = ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids, K);
-        return out;
+        return ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids, K);
     }
 
 
@@ -5731,6 +5732,253 @@ struct test_ssm_scan : public test_case {
                 init_tensor_uniform(t);
             }
         }
+    }
+};
+
+struct test_ssm_scan_replay : public test_case {
+    const int32_t window;
+    const int64_t d_state;
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_group;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int32_t count; // -1 mixes empty, partial and full histories across rows.
+    const bool xbc_overlap;
+    const bool shared_ids;
+    bool alias_checkpoint = false;
+    ggml_tensor * s;
+    ggml_tensor * x;
+    ggml_tensor * dt;
+    ggml_tensor * A;
+    ggml_tensor * B;
+    ggml_tensor * C;
+    ggml_tensor * ids;
+    ggml_tensor * x_cache;
+    ggml_tensor * dt_cache;
+    ggml_tensor * B_cache;
+
+    test_ssm_scan_replay(int32_t window, int64_t d_state, int64_t head_dim, int64_t n_head,
+                        int64_t n_group, int64_t n_seq_tokens, int64_t n_seqs, int32_t count,
+                        bool xbc_overlap = false, bool shared_ids = false)
+        : window(window), d_state(d_state), head_dim(head_dim), n_head(n_head), n_group(n_group),
+          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), count(count), xbc_overlap(xbc_overlap),
+          shared_ids(shared_ids) {}
+
+    std::string vars() override {
+        return VARS_TO_STR10(window, d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, count, xbc_overlap, shared_ids);
+    }
+
+    double max_nmse_err() override { return n_seq_tokens > 128 ? 2e-7 : 1e-7; }
+
+    void build_inputs(ggml_context * ctx) {
+        const int64_t n_slots = n_seqs + alias_checkpoint;
+        s        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_state*head_dim*n_head, n_slots);
+        x_cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, window*head_dim*n_head, n_slots);
+        dt_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, window*n_head, n_slots);
+        B_cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, window*d_state*n_group, n_slots);
+        dt  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_head, n_seq_tokens, n_seqs);
+        A   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_head);
+        if (xbc_overlap) {
+            ggml_tensor * xbc = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim*n_head + 2*d_state*n_group, n_seq_tokens, n_seqs);
+            x = ggml_view_4d(ctx, xbc, head_dim, n_head, n_seq_tokens, n_seqs,
+                             head_dim*sizeof(float), xbc->nb[1], xbc->nb[2], 0);
+            B = ggml_view_4d(ctx, xbc, d_state, n_group, n_seq_tokens, n_seqs,
+                             d_state*sizeof(float), xbc->nb[1], xbc->nb[2], head_dim*n_head*sizeof(float));
+            C = ggml_view_4d(ctx, xbc, d_state, n_group, n_seq_tokens, n_seqs,
+                             d_state*sizeof(float), xbc->nb[1], xbc->nb[2], (head_dim*n_head + d_state*n_group)*sizeof(float));
+        } else {
+            // Move slot 1 to slot 0 while the current x still reads slot 0.
+            x = alias_checkpoint ? ggml_view_2d(ctx, s, head_dim, n_head, head_dim*sizeof(float), 0)
+                                 : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_head, n_seq_tokens, n_seqs);
+            B = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d_state, n_group, n_seq_tokens, n_seqs);
+            C = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d_state, n_group, n_seq_tokens, n_seqs);
+        }
+        ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_seqs, 2);
+        ggml_set_name(dt_cache, "replay_dt_cache");
+        ggml_set_name(A, "replay_A");
+        ggml_set_name(ids, "replay_ids");
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        build_inputs(ctx);
+        return ggml_ssm_scan_replay(ctx, s, x, dt, A, B, C, ids, x_cache, dt_cache, B_cache, window);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const auto pending = [&](int64_t seq) {
+            return count >= 0 ? count : seq % 3 == 0 ? 0 : seq % 3 == 1 ? window / 2 : window - 1;
+        };
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                if (strcmp(t->name, "replay_ids") == 0) {
+                    for (int64_t i = 0; i < n_seqs; ++i) {
+                        data[i] = shared_ids && i == n_seqs - 1 ? n_seqs - 1 : n_seqs - 1 - i;
+                        data[i] += alias_checkpoint;
+                        data[n_seqs + i] = pending(data[i]);
+                    }
+                } else {
+                    std::iota(data.begin(), data.end(), 0);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "replay_A") == 0) {
+                init_tensor_uniform(t, -0.1f, -0.01f);
+            } else if (strcmp(t->name, "replay_dt_cache") == 0) {
+                init_tensor_uniform(t, 0.4f, 0.6f);
+            } else {
+                init_tensor_uniform(t, -0.125f, 0.125f);
+            }
+        }
+    }
+};
+
+// These graphs compute the error against a reference on each backend.
+struct test_ssm_scan_replay_error : public test_ssm_scan_replay {
+    using test_ssm_scan_replay::test_ssm_scan_replay;
+    bool run_whole_graph() override { return true; }
+    double max_err() override { return 1e-5; }
+    double max_err(ggml_backend_t) override { return max_err(); }
+    double err(const float * a, const float * b, size_t n) override {
+        double result = 0;
+        for (size_t i = 0; i < n; ++i) {
+            result = std::max(result, (double) std::max(fabsf(a[i]), fabsf(b[i])));
+        }
+        return result;
+    }
+};
+
+struct test_ssm_scan_replay_coefficient : public test_ssm_scan_replay_error {
+    ggml_tensor * expected;
+    static constexpr float raw_dt = 2.392912149f;
+
+    test_ssm_scan_replay_coefficient(int32_t window, int32_t count)
+        : test_ssm_scan_replay_error(window, 128, 64, 4, 2, 1, 1, count) {}
+
+    std::string op_desc(ggml_tensor *) override { return "SSM_SCAN_REPLAY_COEFFICIENT"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_ssm_scan_replay::build_graph(ctx);
+        expected = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(x));
+        return ggml_sub(ctx, ggml_view_1d(ctx, out, ggml_nelements(x), 0), expected);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_ssm_scan_replay::initialize_tensors(ctx);
+        // captured model values: |A| is large, so a record only counts when the dt after it are tiny
+        const float  A_head  = -52838.74609375f;
+        const float  raw_cur = -14.0f;
+        const double dt_rec  = std::log1p(std::exp((double) raw_dt));
+        const double dt_cur  = std::log1p(std::exp((double) raw_cur));
+        init_tensor_uniform(A, A_head, A_head);
+        init_tensor_uniform(dt, raw_cur, raw_cur);
+        init_tensor_uniform(x, 1.0f, 1.0f);
+        init_tensor_uniform(B, 1.0f, 1.0f);
+        init_tensor_uniform(C, 1.0f/d_state, 1.0f/d_state);
+        // the last three records are tiny as well, so the record before them still counts
+        const auto dt_step = [&](int32_t j) { return j == count || (j > 0 && j >= count - 3) ? dt_cur : dt_rec; };
+        init_tensor_uniform(s, 0.0f, 0.0f);
+        init_tensor_uniform(x_cache, 1.0f, 1.0f);
+        init_tensor_uniform(B_cache, 1.0f, 1.0f);
+        std::vector<float> steps(ggml_nelements(dt_cache));
+        for (int32_t j = 0; j < count; ++j) {
+            std::fill_n(steps.data() + j*n_head, n_head, (float) dt_step(j));
+        }
+        ggml_backend_tensor_set(dt_cache, steps.data(), 0, ggml_nbytes(dt_cache));
+        // every step, scaled by the decay over the dt after it
+        double value = 0.0;
+        double after = 0.0;
+        for (int32_t j = count; j >= 0; --j) {
+            value += dt_step(j)*std::exp(A_head*after);
+            after += dt_step(j);
+        }
+        init_tensor_uniform(expected, (float) value, (float) value);
+    }
+};
+
+struct test_ssm_scan_replay_sequence : public test_ssm_scan_replay_error {
+    test_ssm_scan_replay_sequence(int32_t window, int64_t d_state, int64_t n_seqs,
+                                 int64_t n_group = 2, bool xbc_overlap = false)
+        : test_ssm_scan_replay_error(window, d_state, 32, 4, n_group, 2*window + 11, n_seqs, 0, xbc_overlap) {}
+
+    std::string op_desc(ggml_tensor *) override { return "SSM_SCAN_REPLAY_SEQUENCE"; }
+    size_t max_tensors() override { return 32*n_seq_tokens; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        build_inputs(ctx);
+        const int64_t n_state = d_state*head_dim*n_head;
+        ggml_tensor * identity = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_tensor * caches[] = { s, x_cache, dt_cache, B_cache };
+        ggml_tensor * ids_counts = ids;
+        ggml_tensor * state = ggml_reshape_4d(ctx, s, d_state, head_dim, n_head, n_seqs);
+        ggml_tensor * error = nullptr;
+        for (int64_t t = 0; t < n_seq_tokens;) {
+            const int64_t nt = t == 0 || t == 2*window + 4 ? 3 : t == 2*window + 9 ? 2 : 1;
+            ggml_tensor * xt = ggml_view_4d(ctx, x, head_dim, n_head, nt, n_seqs, x->nb[1], x->nb[2], x->nb[3], t*x->nb[2]);
+            ggml_tensor * bt = ggml_view_4d(ctx, B, d_state, n_group, nt, n_seqs, B->nb[1], B->nb[2], B->nb[3], t*B->nb[2]);
+            ggml_tensor * ct = ggml_view_4d(ctx, C, d_state, n_group, nt, n_seqs, C->nb[1], C->nb[2], C->nb[3], t*C->nb[2]);
+            ggml_tensor * dtt = ggml_cont(ctx, ggml_view_3d(ctx, dt, n_head, nt, n_seqs, dt->nb[1], dt->nb[2], t*dt->nb[1]));
+            ggml_tensor * seq_ids = ggml_view_1d(ctx, ids_counts, n_seqs, 0);
+            ggml_tensor * replay = ggml_ssm_scan_replay(ctx, caches[0], xt, dtt, A, bt, ct, ids_counts,
+                                                       caches[1], caches[2], caches[3], window);
+            ggml_tensor * scan = ggml_ssm_scan(ctx, state, xt, dtt, A, bt, ct, seq_ids, 1);
+            const int64_t n_y = ggml_nelements(xt);
+            ggml_tensor * diff = ggml_sub(ctx, ggml_view_1d(ctx, replay, n_y, 0), ggml_view_1d(ctx, scan, n_y, 0));
+            diff = ggml_sum(ctx, ggml_sqr(ctx, diff));
+            error = error == nullptr ? diff : ggml_add(ctx, error, diff);
+            size_t offset = n_y*sizeof(float);
+            for (ggml_tensor * & cache : caches) {
+                cache = ggml_view_2d(ctx, replay, cache->ne[0], n_seqs, cache->nb[1], offset);
+                offset += ggml_nbytes(cache);
+            }
+            ggml_tensor * counts = ggml_cast(ctx, ggml_view_1d(ctx, replay, n_seqs, offset), GGML_TYPE_I32);
+            ids_counts = ggml_concat(ctx, identity, counts, 1);
+            state = ggml_view_4d(ctx, scan, d_state, head_dim, n_head, n_seqs,
+                                d_state*sizeof(float), d_state*head_dim*sizeof(float), n_state*sizeof(float), n_y*sizeof(float));
+            t += nt;
+        }
+        // The final prefill materializes both states after several window boundaries.
+        ggml_tensor * diff = ggml_sub(ctx, caches[0], ggml_reshape_2d(ctx, state, n_state, n_seqs));
+        return ggml_add(ctx, error, ggml_sum(ctx, ggml_sqr(ctx, diff)));
+    }
+};
+
+struct test_ssm_scan_replay_cache : public test_ssm_scan_replay {
+    const bool read_tail;
+    const bool read_history;
+
+    test_ssm_scan_replay_cache(int64_t d_state, int32_t count, bool read_tail = false, int64_t n_tokens = 1,
+                               int64_t head_dim = 64, int64_t n_head = 4, int64_t n_group = 2, int64_t n_seqs = 1,
+                               bool xbc_overlap = false, bool shared_ids = false, bool read_history = false)
+        : test_ssm_scan_replay(16, d_state, head_dim, n_head, n_group, n_tokens, n_seqs, count, xbc_overlap, shared_ids),
+          read_tail(read_tail), read_history(read_history) {}
+
+    std::string op_desc(ggml_tensor *) override { return read_tail || read_history ? "SSM_SCAN_REPLAY_CACHE_TAIL" : "SSM_SCAN_REPLAY_CACHE"; }
+    std::string vars() override { return test_ssm_scan_replay::vars() + (alias_checkpoint ? ",alias_checkpoint=1" : ""); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_ssm_scan_replay::build_graph(ctx);
+        const int64_t n_y = ggml_nelements(x);
+        ggml_tensor * result = ggml_view_1d(ctx, out, n_y, 0);
+        size_t offset = n_y*sizeof(float);
+        for (ggml_tensor * field : { s, x_cache, dt_cache, B_cache }) {
+            ggml_tensor * tail = ggml_view_2d(ctx, out, field->ne[0], n_seqs, field->nb[1], offset);
+            ggml_tensor * copy = ggml_cpy(ctx, tail, ggml_view_2d(ctx, field, field->ne[0], n_seqs, field->nb[1], 0));
+            if (mode == MODE_TEST) {
+                // Match the model graph: schedule the four cache copies before reading any of their results.
+                ggml_build_forward_expand(gf, copy);
+            }
+            if ((read_tail && field == s) || (read_history && field == B_cache)) {
+                copy = ggml_add(ctx, copy, tail);
+            }
+            result = ggml_concat(ctx, result, ggml_reshape_1d(ctx, copy, ggml_nelements(copy)), 0);
+            offset += ggml_nbytes(copy);
+        }
+        return ggml_concat(ctx, result, ggml_view_1d(ctx, out, n_seqs, offset), 0);
     }
 };
 
@@ -13305,6 +13553,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 128, 2)); // SSD multi-chunk, no tail (exercises the chunk-to-chunk state handoff)
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 128, 2, false, /*K=*/1, /*weak_decay=*/true)); // SSD multi-chunk, carried state not numerically negligible
 
+    // Compare replay against the ordinary scan across window boundaries and a return to prefill.
+    for (int32_t window : { 1, 16, 32 }) {
+        test_cases.emplace_back(new test_ssm_scan_replay_sequence(window, 128, 2));
+    }
+    test_cases.emplace_back(new test_ssm_scan_replay_sequence(4, 64, 2));
+    test_cases.emplace_back(new test_ssm_scan_replay_sequence(4, 96, 1, 1, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_sequence(8, 256, 4, 4, true));
+    test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 80, 8, 2, 300, 2, 7));
+    test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 16, 16, 8, 1, 4, -1, true, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 1));
+    test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 15));
+    // The copy fusion must preserve external readers, shared rows and overlapping inputs.
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(128, 7));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(128, 7, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(128, 7, false, 300));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(64, 7, false, 300));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(64, 7, false, 4, 64, 4, 2, 2));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(64, 15, false, 1, 64, 4, 2, 3));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(128, -1, false, 1, 32, 8, 1, 4, true, true));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(128, 7, false, 1, 64, 4, 2, 1, false, false, true));
+    auto * alias = new test_ssm_scan_replay_cache(128, 7);
+    alias->alias_checkpoint = true;
+    test_cases.emplace_back(alias);
+
     // ssm_scan + cache cpy fusion
     test_cases.emplace_back(new test_ssm_scan_cache_fusion(GGML_TYPE_F32, 128, 64, 16, 2, 4, 1, 4));
     test_cases.emplace_back(new test_ssm_scan_cache_fusion(GGML_TYPE_F32, 128, 64, 16, 2, 1, 1, 4)); // n_seq_tokens < K
@@ -15943,6 +16215,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 512, 1)); // Nemotron-9B prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 1,   1)); // Nemotron-9B generate
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 96, 8, 1, 1)); // Nemotron-3-Nano-4B
+    for (int32_t count : { 0, 7, 15 }) {
+        test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 80, 96, 8, 1, 1, count));
+    }
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 512, 1));	// Mamba-2 prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2,   1, 1));	// Mamba-2 generate
@@ -16231,13 +16507,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases(test_mode mode, c
 }
 
 static bool test_case_selected(const test_mode mode, const char * op_names_filter, const char * params_filter, const char * test_file_path) {
-    ggml_init_params params = {
-        /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
-        /* .mem_base = */ NULL,
-        /* .no_alloc = */ true,
-    };
-
     for (auto & tc : make_test_cases(mode, params_filter, test_file_path)) {
+        ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead()*tc->max_tensors() + ggml_graph_overhead(),
+            /* .mem_base = */ NULL,
+            /* .no_alloc = */ true,
+        };
         ggml_context_ptr ctx(ggml_init(params));
         GGML_ASSERT(ctx);
         ggml_context_ptr ctx_weights(tc->use_weight_context() ? ggml_init(params) : nullptr);
