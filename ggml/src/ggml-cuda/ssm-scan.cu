@@ -1132,11 +1132,13 @@ static __global__ void ssm_replay_commit(
 template<int d_state>
 static __global__ void ssm_replay_checkpoint(float * s, const float * A, const int32_t * counts, ssm_replay_history hist,
             int64_t capacity, int64_t heads, int64_t width, int64_t groups, int window, int nt) {
-    const int seq = blockIdx.y, head = blockIdx.x, h = counts[seq];
+    const int seq = blockIdx.z, head = blockIdx.y, h = counts[seq];
     if (h < 0 || (h > window && h > capacity-window)) { __trap(); }
     if (h == 0 || (nt <= capacity-window && h + (int64_t)nt <= window)) { return; }
     const int lane = threadIdx.x%WARP_SIZE, group = head/(heads/groups);
-    for (int64_t col = head*width + threadIdx.x/WARP_SIZE; col < (head+1)*width; col += blockDim.x/WARP_SIZE) {
+    const int warps = blockDim.x/WARP_SIZE;
+    for (int64_t m = blockIdx.x*warps + threadIdx.x/WARP_SIZE; m < width; m += gridDim.x*warps) {
+        const int64_t col = head*width + m;
         float * dst = s + (seq*heads*width+col)*d_state + lane;
         float state[d_state/WARP_SIZE];
 #pragma unroll
@@ -1160,7 +1162,12 @@ void ggml_cuda_op_ssm_replay_checkpoint(ggml_backend_cuda_context & ctx, ggml_te
     const ssm_replay_history hist = { (const float *)x->data, (const float *)dt->data, (const float *)B->data };
     const auto kernel = state == 64 ? ssm_replay_checkpoint<64> : state == 96 ? ssm_replay_checkpoint<96> :
                         state == 128 ? ssm_replay_checkpoint<128> : ssm_replay_checkpoint<256>;
-    kernel<<<dim3(heads,dst->ne[1]), 4*WARP_SIZE, 0, ctx.stream()>>>((float *)dst->data,
+    constexpr int warps = 4;
+    const int64_t nheads = heads*dst->ne[1];
+    // Spread small batches over the SMs and keep one block per head when the batch already fills the device.
+    const int64_t blocks = 4*ggml_cuda_info().devices[ctx.device].nsm;
+    const int tiles = std::min((inner/heads + warps-1)/warps, (blocks + nheads-1)/nheads);
+    kernel<<<dim3(tiles,heads,dst->ne[1]), warps*WARP_SIZE, 0, ctx.stream()>>>((float *)dst->data,
             (const float *)dst->src[1]->data, (const int32_t *)dst->src[2]->data, hist, capacity, heads, inner/heads,
             groups, ggml_get_op_params_i32(dst,0), ggml_get_op_params_i32(dst,1));
 }
