@@ -2353,7 +2353,8 @@ extern "C" {
             struct ggml_tensor * x_cache, struct ggml_tensor * dt_cache, struct ggml_tensor * B_cache,
             int32_t window, int64_t n_tokens);
 
-    // Read the checkpoint view and produce y plus the T new x, softplus(dt) and B vectors in sequence order.
+    // Pass the view returned by ggml_ssm_replay_checkpoint with the same counts, window and T.
+    // Return y and the T new x, softplus(dt) and B vectors in sequence order.
     // T > max_verify uses the ordinary scan and returns y and final states. Cache capacity is window + max_verify.
     GGML_API struct ggml_tensor * ggml_ssm_scan_replay_verify(
             struct ggml_context * ctx, struct ggml_tensor * s, struct ggml_tensor * x, struct ggml_tensor * dt,
