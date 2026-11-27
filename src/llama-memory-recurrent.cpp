@@ -1328,7 +1328,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             io.read(&s_size_row_ref, sizeof(s_size_row_ref));
             const size_t s_size_row = s_l[il]->nb[1];
             const auto & history = mamba_replay_l[il];
-            if (layout == 0 && history.x) {
+            if (layout == 0 && history.x && s_size_row_ref != s_size_row) {
                 // Older ReplaySSM saves interleaved x, dt, B records after each dense checkpoint.
                 if ((flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) ||
                     s_size_row_ref != s_size_row + history.x->nb[1] + history.dt->nb[1] + history.b->nb[1] + sizeof(float)) {
@@ -1361,6 +1361,10 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
 
             if (cell_count) {
                 io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
+                if (layout == 0 && history.count) {
+                    // A dense state is a complete checkpoint with no pending inputs.
+                    ggml_backend_tensor_memset(history.count, 0, head*history.count->nb[1], cell_count*history.count->nb[1]);
+                }
             }
         }
     } else {
