@@ -527,39 +527,50 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
-    const int64_t n_rs = mctx->get_n_rs();
-
-    if (s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
-        int32_t * data = (int32_t *) s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->s_copy(i);
-        }
-    }
-
-    set_input_rep(mctx, ubatch);
+    set_input_rs(mctx, ubatch);
 }
 
-void llm_graph_input_rs::set_input_rep(const llama_memory_recurrent_context * mctx, const llama_ubatch * ubatch) {
+void llm_graph_input_rs::set_input_rs(const llama_memory_recurrent_context * mctx, const llama_ubatch * ubatch) {
+    if (s_copy) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
+        GGML_ASSERT(!move_src || (ggml_backend_buffer_is_host(move_src->buffer) && ggml_backend_buffer_is_host(move_dst->buffer)));
+        const uint32_t n_rs = mctx->get_n_rs();
+        int64_t n_move = 0;
+        for (uint32_t i = 0; i < n_rs; ++i) {
+            const int32_t src = mctx->s_copy(i);
+            ((int32_t *) s_copy->data)[i] = src;
+            if (move_src && src != (int32_t) (head + i)) {
+                GGML_ASSERT(n_move < move_src->ne[0]);
+                ((int32_t *) move_src->data)[n_move] = src;
+                ((int32_t *) move_dst->data)[n_move++] = i;
+            }
+        }
+        GGML_ASSERT(!move_src || n_move == move_src->ne[0]);
+    }
     if (!has_rep) {
         return;
     }
 
     const int64_t n_seqs = ubatch->n_seqs;
 
-    int32_t * reps = (int32_t *) rep_n->data;
     int32_t * cols = (int32_t *) rep_cols->data;
-
-    GGML_ASSERT(ggml_backend_buffer_is_host(rep_n->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(rep_cols->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(rep_n->buffer));
+    GGML_ASSERT(!feature_dst || ggml_backend_buffer_is_host(feature_dst->buffer));
 
     for (int64_t s = 0; s < n_seqs; ++s) {
         const int64_t n_rep = mctx->get_rs_rep(s);
         GGML_ASSERT(n_rep <= n_pend);
 
-        reps[s] = n_rep;
+        const int32_t h = mamba_window ? mctx->get_mamba_rep(s) : n_rep;
+        ((int32_t *) rep_n->data)[s] = h;
+        if (feature_dst) {
+            const int64_t t = ubatch->n_seq_tokens;
+            const int64_t start = s*(mamba_window + n_pend) + (h + t <= mamba_window ? h : 0);
+            for (int64_t i = 0; i < t; ++i) {
+                ((int64_t *) feature_dst->data)[s*t + i] = start + i;
+            }
+        }
 
         // the conv history is [window | pending]: the window after the kept tokens
         for (int64_t c = 0; c < n_conv; ++c) {
@@ -573,16 +584,13 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     this->mctx = mctx;
 
-    bool res = true;
+    return can_reuse_rs(mctx, params.ubatch);
+}
 
-    res &= s_copy->ne[0] == mctx->get_n_rs();
-
-    res &= s_copy_main->ne[0] == params.ubatch.n_seqs;
-
-    res &= head == mctx->get_head();
-    res &= rs_z == mctx->get_rs_z();
-
-    return res;
+bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mctx, const llama_ubatch & ubatch) const {
+    return s_copy->ne[0] == mctx->get_n_rs() && s_copy_main->ne[0] == ubatch.n_seqs &&
+        head == mctx->get_head() && rs_z == mctx->get_rs_z() &&
+        (!mamba_window || (move_src ? move_src->ne[0] : 0) == mctx->get_n_mamba_moves());
 }
 
 void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
@@ -1276,19 +1284,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     // kv_rows and the mask stay unallocated if all attention layers have their own (e.g. qwen4exp QSA)
     mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
-
-    inp_rs->set_input_rep(mctx->get_recr(), ubatch);
+    inp_rs->set_input_rs(mctx->get_recr(), ubatch);
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1303,12 +1299,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_attn_mask(inp_attn->self_attn_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
-
-    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
-
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_rs(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1324,19 +1315,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
     }
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
-
-    inp_rs->set_input_rep(mctx->get_recr(), ubatch);
+    inp_rs->set_input_rs(mctx->get_recr(), ubatch);
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1350,12 +1329,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_attn_mask(inp_attn->self_attn_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
-
-    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
-
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_rs(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1383,19 +1357,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
     }
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
-
-    inp_rs->set_input_rep(mctx->get_recr(), ubatch);
+    inp_rs->set_input_rs(mctx->get_recr(), ubatch);
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -1423,12 +1385,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= can_reuse_attn_mask(inp_attn->self_attn_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
-
-    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
-
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_rs(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1464,19 +1421,7 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
     }
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
-
-    inp_rs->set_input_rep(mctx->get_recr(), ubatch);
+    inp_rs->set_input_rs(mctx->get_recr(), ubatch);
 }
 
 bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & params) {
@@ -1510,12 +1455,7 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
-
-    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
-
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_rs(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -4247,6 +4187,21 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         inp->rep_n = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
         ggml_set_input(inp->rep_n);
         ggml_set_name(inp->rep_n, "rs_rep_n");
+        if (cparams.ssm_replay_window) {
+            inp->mamba_window = cparams.ssm_replay_window;
+            const uint32_t n_move = mctx_cur->get_n_mamba_moves();
+            if (n_move) {
+                inp->move_src = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_move);
+                inp->move_dst = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_move);
+                ggml_set_input(inp->move_src);
+                ggml_set_input(inp->move_dst);
+            }
+            if (ubatch.n_seq_tokens <= inp->n_pend) {
+                inp->feature_dst = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, ubatch.n_tokens);
+                ggml_set_input(inp->feature_dst);
+                ggml_set_name(inp->feature_dst, "ssm_feature_dst");
+            }
+        }
     }
 
     return inp;

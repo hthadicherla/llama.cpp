@@ -434,6 +434,7 @@ extern "C" {
         GGML_OP_SLEEP,
 
         GGML_OP_SIGMOID_BACK,
+        GGML_OP_SSM_REPLAY_CHECKPOINT,
 
         GGML_OP_COUNT,
     };
@@ -2344,6 +2345,20 @@ extern "C" {
             struct ggml_tensor  * dt_cache,
             struct ggml_tensor  * B_cache,
             int32_t               window);
+
+    // Fold prior accepted inputs into s in-place when this batch overflows the window or is a long prefill.
+    // s and the three histories are in active sequence order; counts contains one accepted length per sequence.
+    GGML_API struct ggml_tensor * ggml_ssm_replay_checkpoint(
+            struct ggml_context * ctx, struct ggml_tensor * s, struct ggml_tensor * A, struct ggml_tensor * counts,
+            struct ggml_tensor * x_cache, struct ggml_tensor * dt_cache, struct ggml_tensor * B_cache,
+            int32_t window, int64_t n_tokens);
+
+    // Use the checkpoint returned by ggml_ssm_replay_checkpoint for this block.
+    // Return y and the T new x, softplus(dt) and B vectors in sequence order.
+    // T > max_verify uses the ordinary scan and returns y and final states. Cache capacity is window + max_verify.
+    GGML_API struct ggml_tensor * ggml_ssm_scan_replay_verify(
+            struct ggml_context * ctx, struct ggml_tensor * checkpoint, struct ggml_tensor * x,
+            struct ggml_tensor * dt, struct ggml_tensor * B, struct ggml_tensor * C);
 
     // partition into non-overlapping windows with padding if needed
     // example:

@@ -1118,9 +1118,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 
     "SIGMOID_BACK",
+    "SSM_REPLAY_CHECKPOINT",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1235,9 +1236,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 
     "sigmoid_back(x)",
+    "ssm_replay_checkpoint(s)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5753,7 +5755,7 @@ struct ggml_tensor * ggml_ssm_scan(
     return result;
 }
 
-struct ggml_tensor * ggml_ssm_scan_replay(
+static struct ggml_tensor * ggml_ssm_scan_replay_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * s,
         struct ggml_tensor  * x,
@@ -5765,12 +5767,13 @@ struct ggml_tensor * ggml_ssm_scan_replay(
         struct ggml_tensor  * x_cache,
         struct ggml_tensor  * dt_cache,
         struct ggml_tensor  * B_cache,
-        int32_t               window) {
+        int32_t               window,
+        bool                  verify) {
     GGML_ASSERT(window >= 1 && window <= 32);
     GGML_ASSERT(s->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && dt->type == GGML_TYPE_F32);
     GGML_ASSERT(A->type == GGML_TYPE_F32 && B->type == GGML_TYPE_F32 && C->type == GGML_TYPE_F32);
     GGML_ASSERT(ids_counts->type == GGML_TYPE_I32 && ggml_is_matrix(ids_counts) && ggml_is_contiguous(ids_counts));
-    GGML_ASSERT(ids_counts->ne[0] == x->ne[3] && ids_counts->ne[1] == 2);
+    GGML_ASSERT(ids_counts->ne[0] == x->ne[3] && ids_counts->ne[1] == (verify ? 1 : 2));
     GGML_ASSERT(ggml_is_matrix(s) && ggml_is_contiguous(s));
     GGML_ASSERT(ggml_is_3d(dt) && ggml_is_contiguous(dt));
     GGML_ASSERT(ggml_is_matrix(A) && ggml_is_contiguous(A));
@@ -5790,17 +5793,24 @@ struct ggml_tensor * ggml_ssm_scan_replay(
     GGML_ASSERT(s->ne[0] == n_state);
     struct ggml_tensor * caches[] = { x_cache, dt_cache, B_cache };
     const int64_t widths[] = { d_inner, n_head, d_state*n_group };
-    int64_t n_out_row = n_state + 1; // checkpoint and pending count
+    const int64_t capacity = x_cache->ne[0] / d_inner;
+    GGML_ASSERT(verify ? capacity > window && s->ne[1] == x->ne[3] : capacity == window);
+    const bool prefill = verify && x->ne[2] > capacity - window;
+    const int64_t n_features = verify ? (prefill ? 0 : x->ne[2]) : capacity;
+    int64_t n_out = ggml_nelements(x);
+    if (!verify || prefill) {
+        n_out += x->ne[3]*(n_state + !verify);
+    }
     for (int i = 0; i < 3; ++i) {
         GGML_ASSERT(caches[i]->type == GGML_TYPE_F32 && ggml_is_matrix(caches[i]) && ggml_is_contiguous(caches[i]));
-        GGML_ASSERT(caches[i]->ne[0] == window*widths[i] && caches[i]->ne[1] == s->ne[1]);
-        n_out_row += caches[i]->ne[0];
+        GGML_ASSERT(caches[i]->ne[0] == capacity*widths[i] && caches[i]->ne[1] == s->ne[1]);
+        n_out += x->ne[3]*n_features*widths[i];
     }
     GGML_ASSERT(dt->ne[0] == n_head && dt->ne[1] == x->ne[2] && dt->ne[2] == x->ne[3]);
     GGML_ASSERT(A->ne[0] == 1 && A->ne[1] == n_head);
     GGML_ASSERT(B->ne[2] == x->ne[2] && B->ne[3] == x->ne[3]);
 
-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(x) + n_out_row*x->ne[3]);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_out);
     result->op     = GGML_OP_SSM_SCAN;
     result->src[0] = s;
     result->src[1] = x;
@@ -5815,6 +5825,56 @@ struct ggml_tensor * ggml_ssm_scan_replay(
     ggml_set_op_params_i32(result, 0, 1); // one updated state row per sequence
     ggml_set_op_params_i32(result, 1, window);
     return result;
+}
+
+struct ggml_tensor * ggml_ssm_scan_replay(
+        struct ggml_context * ctx, struct ggml_tensor * s, struct ggml_tensor * x, struct ggml_tensor * dt,
+        struct ggml_tensor * A, struct ggml_tensor * B, struct ggml_tensor * C, struct ggml_tensor * ids,
+        struct ggml_tensor * x_cache, struct ggml_tensor * dt_cache, struct ggml_tensor * B_cache, int32_t window) {
+    return ggml_ssm_scan_replay_impl(ctx, s, x, dt, A, B, C, ids, x_cache, dt_cache, B_cache, window, false);
+}
+
+struct ggml_tensor * ggml_ssm_replay_checkpoint(
+        struct ggml_context * ctx, struct ggml_tensor * s, struct ggml_tensor * A, struct ggml_tensor * counts,
+        struct ggml_tensor * x_cache, struct ggml_tensor * dt_cache, struct ggml_tensor * B_cache,
+        int32_t window, int64_t n_tokens) {
+    GGML_ASSERT(window >= 1 && window <= 32 && n_tokens > 0 && n_tokens <= INT32_MAX);
+    GGML_ASSERT(A->ne[0] == 1 && A->ne[1] > 0 && ggml_is_matrix(A) && ggml_is_contiguous(A) && A->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_vector(counts) && ggml_is_contiguous(counts) && counts->type == GGML_TYPE_I32);
+    struct ggml_tensor * fields[] = { s, x_cache, dt_cache, B_cache };
+    for (int i = 0; i < 4; ++i) {
+        GGML_ASSERT(fields[i]->type == GGML_TYPE_F32 && ggml_is_matrix(fields[i]) && ggml_is_contiguous(fields[i]));
+        GGML_ASSERT(fields[i]->ne[1] == counts->ne[0]);
+    }
+    const int64_t heads = A->ne[1], capacity = dt_cache->ne[0]/heads;
+    GGML_ASSERT(capacity > window && dt_cache->ne[0] == heads*capacity);
+    const int64_t inner = x_cache->ne[0]/capacity;
+    GGML_ASSERT(inner > 0 && inner%heads == 0 && x_cache->ne[0] == inner*capacity);
+    const int64_t state = s->ne[0]/inner;
+    GGML_ASSERT(state > 0 && state <= INT_MAX && s->ne[0] == state*inner);
+    const int64_t groups = B_cache->ne[0]/(capacity*state);
+    GGML_ASSERT(groups > 0 && heads%groups == 0 && B_cache->ne[0] == capacity*state*groups);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, s);
+    result->op = GGML_OP_SSM_REPLAY_CHECKPOINT;
+    result->src[0] = s;
+    result->src[1] = A;
+    result->src[2] = counts;
+    result->src[3] = x_cache;
+    result->src[4] = dt_cache;
+    result->src[5] = B_cache;
+    ggml_set_op_params_i32(result, 0, window);
+    ggml_set_op_params_i32(result, 1, (int32_t) n_tokens);
+    return result;
+}
+
+struct ggml_tensor * ggml_ssm_scan_replay_verify(
+        struct ggml_context * ctx, struct ggml_tensor * checkpoint, struct ggml_tensor * x,
+        struct ggml_tensor * dt, struct ggml_tensor * B, struct ggml_tensor * C) {
+    GGML_ASSERT(checkpoint->op == GGML_OP_SSM_REPLAY_CHECKPOINT && ggml_get_op_params_i32(checkpoint, 1) == x->ne[2]);
+    GGML_ASSERT(x->ne[0] <= INT_MAX);
+    return ggml_ssm_scan_replay_impl(ctx, checkpoint, x, dt, checkpoint->src[1], B, C, checkpoint->src[2],
+            checkpoint->src[3], checkpoint->src[4], checkpoint->src[5], ggml_get_op_params_i32(checkpoint, 0), true);
 }
 
 // ggml_win_part

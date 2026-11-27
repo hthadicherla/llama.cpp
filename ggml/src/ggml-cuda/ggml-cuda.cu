@@ -2764,6 +2764,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SSM_SCAN:
             ggml_cuda_op_ssm_scan(ctx, dst);
             break;
+        case GGML_OP_SSM_REPLAY_CHECKPOINT:
+            ggml_cuda_op_ssm_replay_checkpoint(ctx, dst);
+            break;
         case GGML_OP_TOP_K:
             ggml_cuda_op_top_k(ctx, dst);
             break;
@@ -4044,6 +4047,10 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
     return ggml_backend_cuda_host_buffer_type();
 }
 
+static bool ggml_cuda_supports_mamba2_scan(int64_t d_state, int64_t head_dim) {
+    return (d_state == 64 || d_state == 96 || d_state == 128 || d_state == 256) && head_dim % 16 == 0;
+}
+
 // TODO: move these functions here
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
@@ -4416,6 +4423,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                    (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
                    (op->type         == GGML_TYPE_F32 || op->type         == GGML_TYPE_F16);
+        case GGML_OP_SSM_REPLAY_CHECKPOINT: {
+            const int64_t heads = op->src[1]->ne[1];
+            const int64_t capacity = op->src[4]->ne[0]/heads;
+            const int64_t inner = op->src[3]->ne[0]/capacity;
+            // The checkpoint stays resident on the device that also runs the Mamba-2 scan.
+            return ggml_cuda_supports_mamba2_scan(op->ne[0]/inner, inner/heads);
+        }
         case GGML_OP_SSM_SCAN: {
             const int32_t K = ggml_get_op_params_i32(op, 0);
             const int32_t window = ggml_get_op_params_i32(op, 1);
@@ -4429,7 +4443,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         return false;
                     }
                 }
-                if (op->src[6]->ne[1] != 2 || !ggml_is_contiguous(op->src[6])) {
+                if ((op->src[6]->ne[1] != 2 && op->src[6]->ne[1] != 1) || !ggml_is_contiguous(op->src[6])) {
                     return false;
                 }
                 for (int i = 7; i <= 9; ++i) {
@@ -4442,7 +4456,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             if (op->src[3]->ne[0] == 1) {
                 // Mamba2
                 const int64_t d_state = op->src[4]->ne[0];
-                return (d_state == 64 || d_state == 96 || d_state == 128 || d_state == 256) && op->src[1]->ne[0] % 16 == 0;
+                return ggml_cuda_supports_mamba2_scan(d_state, op->src[1]->ne[0]);
             } else {
                 if (K > 1) {
                     return false;

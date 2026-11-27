@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -182,6 +183,99 @@ struct case_multi_seq_split_replay : ctx_test {
         TLOG_INF("%s: seq-1-only decode is independent of seq 0 (max diff %g, nmse %g)\n",
                 __func__, (double) diff_tail.diff_max, diff_tail.nmse());
 
+        return case_result::pass();
+    }
+};
+
+// Changing rejected candidates must leave every retained prefix and its continuation identical.
+struct case_mamba_replay : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+    const char * name() const override { return "mamba_replay"; }
+    const char * description() const override { return "replay the accepted Mamba-2 prefixes of two sequences"; }
+
+    case_result run(model_run & mr) const override {
+        char arch_name[64] = {};
+        llama_model_meta_val_str(mr.model, "general.architecture", arch_name, sizeof(arch_name));
+        const llm_arch arch = llama_arch_from_string(arch_name);
+        if (arch != LLM_ARCH_NEMOTRON_H && arch != LLM_ARCH_NEMOTRON_H_MOE) {
+            return case_result::skip("Mamba-2 rollback is unavailable");
+        }
+
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+        constexpr llama_pos n_prompt = 8;
+        constexpr llama_pos n_verify = 4;
+        ctx_opts opts;
+        opts.n_ctx     = 512;
+        opts.n_batch   = 16;
+        opts.n_ubatch  = 16;
+        opts.n_seq_max = 2;
+        opts.n_rs_seq  = n_verify - 1;
+        opts.fill      = mr.fill;
+
+        common_params params = mr.params;
+        params.use_replayssm = true;
+        params.replayssm_buffer_len = 16;
+        auto replay = make_ctx(mr.model, params, opts);
+        auto other  = make_ctx(mr.model, params, opts);
+        CTX_REQUIRE(replay && other, "could not create the verification contexts");
+
+        for (auto * ctx : { replay.get(), other.get() }) {
+            for (llama_seq_id s = 0; s < 2; ++s) {
+                CTX_REQUIRE(decode_gen(ctx, n_vocab, s, 0, n_prompt), "prefill failed");
+            }
+        }
+        // In round five, 12 + 4 fits the first slot's window and 13 + 4 flushes the second.
+        const int keep[][2] = { {2, 3}, {4, 4}, {4, 4}, {2, 2}, {1, 3}, {4, 4} };
+        llama_pos pos[2] = { n_prompt, n_prompt };
+        int round = 0;
+        for (const auto & prefix : keep) {
+            for (auto * ctx : { replay.get(), other.get() }) {
+                common_batch batch(ctx);
+                for (llama_seq_id s = 0; s < 2; ++s) {
+                    for (llama_pos t = 0; t < n_verify; ++t) {
+                        llama_token token = gen_token(n_vocab, s, pos[s] + t + round);
+                        if (ctx == other.get() && t >= prefix[s]) {
+                            token = (token + 1) % n_vocab;
+                        }
+                        batch.add(token, pos[s] + t, s, true);
+                    }
+                }
+                CTX_REQUIRE(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "verification failed");
+            }
+            for (llama_seq_id s = 0; s < 2; ++s) {
+                for (int t = 0; t < prefix[s]; ++t) {
+                    const int row = s*n_verify + t;
+                    const float * a = llama_get_logits_ith(replay.get(), row);
+                    const float * b = llama_get_logits_ith(other.get(), row);
+                    CTX_REQUIRE(a && b && std::memcmp(a, b, n_vocab*sizeof(float)) == 0, "rejected suffix changed retained logits");
+                }
+            }
+            for (llama_seq_id s = 0; s < 2; ++s) {
+                pos[s] += prefix[s];
+                if (prefix[s] < n_verify) {
+                    for (auto * ctx : { replay.get(), other.get() }) {
+                        CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx), s, pos[s], -1), "rollback failed");
+                    }
+                }
+            }
+            if (round++ == 0) {
+                const auto flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+                std::vector<uint8_t> short_prefix, long_prefix;
+                auto * ctx = replay.get();
+                CTX_REQUIRE(get_seq_state(ctx, 0, flags, short_prefix) && get_seq_state(ctx, 1, flags, long_prefix), "could not save the two prefixes");
+                CTX_REQUIRE(short_prefix.size() < long_prefix.size(), "the shorter prefix must use fewer bytes");
+                CTX_REQUIRE(set_seq_state(ctx, 0, flags, long_prefix) && set_seq_state(ctx, 0, flags, short_prefix) &&
+                            set_seq_state(ctx, 1, flags, long_prefix), "could not restore the pending prefixes");
+            }
+        }
+        // A silent fallback to dense snapshots would also pass the logit comparison.
+        other.reset();
+        params.use_replayssm = false;
+        auto dense = make_ctx(mr.model, params, opts);
+        std::vector<uint8_t> state;
+        CTX_REQUIRE(dense && decode_gen(dense.get(), n_vocab, 0, 0, n_prompt) &&
+                    get_seq_state(dense.get(), 0, 0, state), "could not save dense state");
+        CTX_REQUIRE(llama_state_seq_set_data(replay.get(), state.data(), state.size(), 0) == 0, "ReplaySSM accepted a dense snapshot");
         return case_result::pass();
     }
 };
@@ -493,6 +587,7 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_rollback>());
     cases.push_back(std::make_unique<case_rollback_bound>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
+    cases.push_back(std::make_unique<case_mamba_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
 
     return cases;

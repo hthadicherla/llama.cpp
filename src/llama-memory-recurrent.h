@@ -112,6 +112,9 @@ public:
         // rs_replay: valid tokens in the pending rows, and the pending tokens the current ubatch replays
         uint32_t rs_pend = 0;
         uint32_t rs_rep  = 0;
+        // Mamba retains inputs across verification blocks; the convolution only retains the last block.
+        uint32_t mamba_pend = 0;
+        uint32_t mamba_rep  = 0;
 
         std::set<llama_seq_id> seq_id;
 
@@ -162,7 +165,8 @@ private:
     std::array<ggml_tensor *, 4> pending_rows(uint32_t il) const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+                          const std::vector<std::array<uint32_t, 2>> & pending, llama_state_seq_flags flags) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count, llama_state_seq_flags flags);
@@ -218,6 +222,8 @@ public:
 
     bool     get_rs_replay() const;
     uint32_t get_rs_rep(int i) const; // pending tokens replayed by ubatch seq i
+    uint32_t get_mamba_rep(int i) const;
+    uint32_t get_n_mamba_moves() const;
 
 private:
     const llama_memory_status status;

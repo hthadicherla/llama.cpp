@@ -328,13 +328,18 @@ public:
     int64_t       n_conv   = 0;       // conv window columns, the widest conv of the model
     int64_t       n_pend   = 0;       // pending slots per seq
     ggml_tensor * rep_n    = nullptr; // I32 [n_seqs], kept pending tokens
+    ggml_tensor * feature_dst = nullptr; // feature rows indexed relative to the first active slot
+    int64_t       mamba_window = 0;
+    ggml_tensor * move_src = nullptr; // absolute source and relative destination of each relocated slot
+    ggml_tensor * move_dst = nullptr;
     ggml_tensor * rep_cols = nullptr; // I32 [n_conv, n_seqs], conv history columns of the window after the kept tokens
 
     // views of rep_cols for the delta-net conv and the PLE conv windows, computed once per graph and shared across layers
     ggml_tensor * rep_cols_r = nullptr;
     ggml_tensor * rep_cols_p = nullptr;
 
-    void set_input_rep(const llama_memory_recurrent_context * mctx, const llama_ubatch * ubatch);
+    void set_input_rs(const llama_memory_recurrent_context * mctx, const llama_ubatch * ubatch);
+    bool can_reuse_rs(const llama_memory_recurrent_context * mctx, const llama_ubatch & ubatch) const;
 
     const llama_memory_recurrent_context * mctx;
 
@@ -1525,6 +1530,19 @@ struct llm_graph_context {
             ggml_tensor * conv_x,
                 int64_t   n_cols,
                  size_t   offs) const;
+
+    bool rs_replay_keep() const;
+
+    // The committed convolution window followed by pending columns. KDA can share gathered rows across blocks.
+    ggml_tensor * build_conv_state_replay(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        conv_states_all,
+            ggml_tensor *        x,
+            int64_t              n_conv,
+            int64_t              channels,
+            int                  il,
+            ggml_tensor *        hist_rows = nullptr,
+            int64_t              blk       = 0) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

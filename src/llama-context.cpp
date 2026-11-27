@@ -202,10 +202,6 @@ llama_context::llama_context(
     if (cparams.ssm_replay_window > 32) {
         throw std::runtime_error("ssm_replay_window must be between 0 and 32");
     }
-    if (cparams.ssm_replay_window > 0 && cparams.n_rs_seq > 0) {
-        LLAMA_LOG_WARN("%s: ReplaySSM disabled with recurrent-state rollback\n", __func__);
-        cparams.ssm_replay_window = 0;
-    }
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
@@ -358,6 +354,19 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+
+    if (cparams.ssm_replay_window > 0 && cparams.n_rs_seq > 0) {
+        if (hparams.ssm_n_group > 0 && (model.arch == LLM_ARCH_NEMOTRON_H || model.arch == LLM_ARCH_NEMOTRON_H_MOE)) {
+            // split_equal keeps the whole verification block, including its anchor, in one ubatch.
+            if ((uint64_t) cparams.n_rs_seq + 1 >= cparams.n_ubatch) {
+                throw std::runtime_error("ReplaySSM verification requires n_ubatch > n_rs_seq + 1");
+            }
+            cparams.rs_replay = true;
+        } else {
+            LLAMA_LOG_WARN("%s: model does not support ReplaySSM verification; using default recurrent rollback\n", __func__);
+            cparams.ssm_replay_window = 0;
+        }
+    }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?

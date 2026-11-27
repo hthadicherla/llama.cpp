@@ -160,6 +160,42 @@ static ggml_tensor * build_mamba2_replay(ggml_context * ctx0, ggml_cgraph * gf, 
     const int64_t head = mctx->get_head();
     const int32_t zero = mctx->get_rs_z();
 
+    if (inp->mamba_window) {
+        if (zero >= 0) {
+            auto * row = ggml_view_1d(ctx0, checkpoint, checkpoint->ne[0], zero*checkpoint->nb[1]);
+            ggml_build_forward_expand(gf, ggml_fill_inplace(ctx0, row, 0));
+        }
+        const auto active = [&](ggml_tensor * cache) {
+            auto * slots = ggml_view_2d(ctx0, cache, cache->ne[0], mctx->get_n_rs(), cache->nb[1], head*cache->nb[1]);
+            if (inp->move_src) {
+                // Gather every relocated source before scattering, including moves into the inactive tail.
+                slots = ggml_set_rows(ctx0, slots, ggml_get_rows(ctx0, cache, inp->move_src), inp->move_dst);
+            }
+            return ggml_view_2d(ctx0, slots, slots->ne[0], n_seqs, slots->nb[1], 0);
+        };
+        auto * state = active(checkpoint);
+        ggml_tensor * features[] = {active(history.x), active(history.dt), active(history.b)};
+        state = ggml_ssm_replay_checkpoint(ctx0, state, A, inp->rep_n, features[0], features[1], features[2], window, x->ne[2]);
+        auto * out = ggml_ssm_scan_replay_verify(ctx0, state, x, dt, B, C);
+        size_t offset = ggml_nelements(x)*ggml_element_size(out);
+        if (inp->feature_dst) {
+            const int64_t capacity = window + inp->n_pend;
+            for (auto * cache : features) {
+                const int64_t width = cache->ne[0]/capacity;
+                const size_t stride = ggml_row_size(out->type, width);
+                auto * rows = ggml_view_2d(ctx0, out, width, inp->feature_dst->ne[0], stride, offset);
+                auto * dst = ggml_reshape_2d(ctx0, cache, width, capacity*n_seqs);
+                ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst, rows, inp->feature_dst));
+                offset += stride*inp->feature_dst->ne[0];
+            }
+        } else {
+            // A long prefill leaves its final state in the checkpoint and starts the next window empty.
+            auto * final = ggml_view_2d(ctx0, out, state->ne[0], n_seqs, state->nb[1], offset);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, final, state));
+        }
+        return out;
+    }
+
     struct {
         ggml_tensor * cache;
         ggml_tensor * extra;
@@ -239,9 +275,6 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
     const int64_t state_slots     = ssm_states_all->ne[1];
 
-    ggml_tensor * conv = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
-    conv               = ggml_reshape_3d(ctx0, conv, d_conv - 1, d_inner + 2 * n_group * d_state, n_seqs);
-
     // d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
 
     // Keep the projection 2D: with a {n_embd, 1, n_seqs} batch the CUDA backend
@@ -262,9 +295,16 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
     // conv
     {
         // => {d_conv - 1 + n_seq_tokens, d_inner + 2*n_group*d_state, n_seqs}
-        ggml_tensor * conv_x = ggml_concat(ctx0, conv, ggml_transpose(ctx0, xBC), 0);
-
-        build_conv_state_store(inp, conv_states_all, conv_x, d_conv - 1, 0);
+        ggml_tensor * conv_x;
+        const int64_t channels = d_inner + 2*n_group*d_state;
+        if (inp->mamba_window) {
+            conv_x = build_conv_state_replay(inp, conv_states_all, xBC, d_conv - 1, channels, il);
+        } else {
+            ggml_tensor * conv = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+            conv = ggml_reshape_3d(ctx0, conv, d_conv - 1, channels, n_seqs);
+            conv_x = ggml_concat(ctx0, conv, ggml_transpose(ctx0, xBC), 0);
+            build_conv_state_store(inp, conv_states_all, conv_x, d_conv - 1, 0);
+        }
 
         // 1D convolution
         // The equivalent is to make a self-overlapping view of conv_x
