@@ -10193,18 +10193,11 @@ static void ggml_compute_forward_ssm_scan_f32(
     const int32_t * ids = (const int32_t *) src6->data;
 
     for (int i3 = 0; i3 < ns; ++i3) {
-        float * s = (float *) ((char *) dst->data + s_off) + i3*(nc*nr*nh);
+        const int row = state_in_dst && src6->ne[1] == 3 ? ids[2*ns + i3] : i3;
+        float * s = (float *) ((char *) dst->data + s_off) + row*(nc*nr*nh);
         const float * s0 = state_in_dst ? s : (const float *) ((const char *) src0->data + ids[i3]*src0->nb[3]);
 
-        const int64_t length = ggml_get_op_params_i32(dst, 1) < 0 ? ids[ns + i3] : nt;
-        GGML_ASSERT(length >= 0 && length <= nt);
-        if (length == 0 && ih0 < ih1) {
-            memcpy(s + ih0*nr*nc, s0 + ih0*nr*nc, (ih1 - ih0)*nr*nc*sizeof(float));
-        }
-        for (int64_t i2 = length; i2 < nt && ih0 < ih1; ++i2) {
-            memset((float *) dst->data + ((i3*nt + i2)*nh + ih0)*nr, 0, (ih1 - ih0)*nr*sizeof(float));
-        }
-        for (int i2 = 0; i2 < length; ++i2) {
+        for (int i2 = 0; i2 < nt; ++i2) {
             const float * x  = (const float *) ((const char *) src1->data + i2*(src1->nb[2]) + i3*(src1->nb[3])); // {dim, nh, nt, ns}
             const float * dt = (const float *) ((const char *) src2->data + i2*(src2->nb[1]) + i3*(src2->nb[2])); // {nh, nt, ns}
             const float * A  = (const float *) ((const char *) src3->data); // {d_state, nh} or {1, nh}
@@ -10377,6 +10370,102 @@ static void ggml_compute_forward_ssm_scan_f32(
     }
 }
 
+static void ggml_compute_forward_ssm_verify(const ggml_compute_params * params, ggml_tensor * dst) {
+    const auto * s = dst->src[0];
+    const auto * x = dst->src[1];
+    const auto * B = dst->src[4];
+    const auto * C = dst->src[5];
+    const auto * ids = (const int32_t *) dst->src[6]->data;
+    const int64_t width = x->ne[0], heads = x->ne[1], nt = x->ne[2], ns = x->ne[3];
+    const int64_t state = B->ne[0], groups = B->ne[1], inner = width*heads;
+    const int64_t capacity = dst->src[7]->ne[0]/inner;
+    const int32_t window = ggml_get_op_params_i32(dst, 1), n_write = ggml_get_op_params_i32(dst, 2);
+    const bool prefill = nt > capacity - window;
+    const int64_t widths[] = { inner, heads, state*groups };
+    const ggml_tensor * inputs[] = { x, dst->src[2], B };
+    float * checkpoints = (float *) dst->data + ggml_nelements(x);
+
+    for (int64_t seq = 0; seq < ns; ++seq) {
+        const int32_t slot = ids[seq], h = ids[ns + seq], row = ids[2*ns + seq];
+        const bool flush = prefill || h + nt > window;
+        GGML_ASSERT(slot >= 0 && slot < s->ne[1] && h >= 0 && h <= std::max<int64_t>(window, capacity - window));
+        GGML_ASSERT(row >= (prefill || (flush && h > 0) ? 0 : -1) && row < n_write);
+        const float * hist[3];
+        float * next = checkpoints + n_write*s->ne[0];
+        for (int f = 0; f < 3; ++f) {
+            const auto * cache = dst->src[7 + f];
+            hist[f] = (const float *) cache->data + slot*cache->ne[0];
+            if (prefill) { continue; }
+            const int dim = f == 1 ? 1 : 2;
+            for (int64_t t = params->ith; t < nt; t += params->nth) {
+                const float * src = (const float *)((const char *)inputs[f]->data + seq*inputs[f]->nb[dim+1] + t*inputs[f]->nb[dim]);
+                float * out = next + (seq*nt+t)*widths[f];
+                if (f == 1) {
+                    for (int64_t j = 0; j < heads; ++j) { out[j] = ggml_compute_softplus_f32(src[j]); }
+                } else {
+                    memcpy(out, src, widths[f]*sizeof(float));
+                }
+            }
+            next += ns*nt*widths[f];
+        }
+        auto feature = [&](int f, int64_t j) {
+            const int dim = f == 1 ? 1 : 2;
+            return j < h ? hist[f] + j*widths[f] :
+                (const float *)((const char *)inputs[f]->data + seq*inputs[f]->nb[dim+1] + (j-h)*inputs[f]->nb[dim]);
+        };
+        for (int64_t head = params->ith; head < heads; head += params->nth) {
+            const int64_t group = head/(heads/groups);
+            const float A = ((const float *)dst->src[3]->data)[head];
+            const float * anchor = (const float *)s->data + slot*s->ne[0] + head*width*state;
+            float * saved = row < 0 ? nullptr : checkpoints + row*s->ne[0] + head*width*state;
+            if (saved) {
+                memcpy(saved, anchor, width*state*sizeof(float));
+            }
+            if (flush && h > 0) {
+                for (int32_t j = 0; j < h; ++j) {
+                    const float dt = hist[1][j*heads + head], decay = expf(A*dt);
+                    const float * v = hist[0] + j*inner + head*width;
+                    const float * b = hist[2] + (j*groups + group)*state;
+                    for (int64_t m = 0; m < width; ++m) {
+                        ggml_vec_scale_f32(state, saved + m*state, decay);
+                        ggml_vec_mad_f32(state, saved + m*state, b, v[m]*dt);
+                    }
+                }
+                anchor = saved;
+            }
+            if (prefill) { continue; }
+            for (int64_t i = 0; i < nt; ++i) {
+                const auto * c = (const float *)((const char *)C->data + seq*C->nb[3] + i*C->nb[2]) + group*state;
+                float * y = (float *)dst->data + (seq*nt+i)*inner + head*width;
+                for (int64_t m = 0; m < width; ++m) {
+                    ggml_vec_dot_f32(state, y+m, 0, anchor + m*state, 0, c, 0, 1);
+                }
+                // Eq. 6: decay the checkpoint readout, then add each input's decayed C.B contribution.
+                const int32_t first = flush ? h : 0;
+                float suffix = 0.0f;
+                for (int64_t j = first; j <= h+i; ++j) {
+                    const float step = feature(1, j)[head];
+                    suffix += j < h ? step : ggml_compute_softplus_f32(step);
+                }
+                ggml_vec_scale_f32(width, y, expf(A*suffix));
+                suffix = 0.0f;
+                for (int64_t j = h+i; j >= first; --j) {
+                    float cb;
+                    ggml_vec_dot_f32(state, &cb, 0, c, 0, feature(2, j) + group*state, 0, 1);
+                    const float step = feature(1, j)[head];
+                    const float dt = j < h ? step : ggml_compute_softplus_f32(step);
+                    ggml_vec_mad_f32(width, y, feature(0, j) + head*width, cb*(dt*expf(A*suffix)));
+                    suffix += dt;
+                }
+            }
+        }
+    }
+    if (prefill) {
+        ggml_barrier(params->threadpool);
+        ggml_compute_forward_ssm_scan_f32(params, dst, true);
+    }
+}
+
 static void ggml_compute_forward_ssm_scan_replay(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -10518,8 +10607,12 @@ void ggml_compute_forward_ssm_scan(
     switch (dst->src[0]->type) {
         case GGML_TYPE_F32:
             {
-                if (ggml_get_op_params_i32(dst, 1) > 0) {
-                    ggml_compute_forward_ssm_scan_replay(params, dst);
+                if (ggml_get_op_params_i32(dst, 1) != 0) {
+                    if (dst->src[6]->ne[1] == 3) {
+                        ggml_compute_forward_ssm_verify(params, dst);
+                    } else {
+                        ggml_compute_forward_ssm_scan_replay(params, dst);
+                    }
                 } else {
                     ggml_compute_forward_ssm_scan_f32(params, dst);
                 }

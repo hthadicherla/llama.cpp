@@ -166,30 +166,78 @@ static ggml_tensor * build_mamba2_replay(ggml_context * ctx0, ggml_cgraph * gf, 
     } fields[] = {{checkpoint, nullptr}, {history.x, nullptr}, {history.dt, nullptr},
                   {history.b, nullptr}, {history.count, nullptr}};
 
-    // Read every inactive source before any active destination can overwrite it.
+    // Gather sources before any overlapping slot moves or verifier writes.
     for (auto & field : fields) {
         auto * cache = field.cache;
-        if (zero >= 0) {
+        if (!cache) {
+            continue;
+        }
+        const bool features = inp->verify_ids && cache != checkpoint;
+        if (zero >= 0 && !features) {
             auto * row = ggml_view_1d(ctx0, cache, cache->ne[0], zero*cache->nb[1]);
             auto * clear = cache == history.count ? ggml_cpy(ctx0, ggml_arange(ctx0, 0, 1, 1), row)
                                                   : ggml_fill_inplace(ctx0, row, 0);
             ggml_build_forward_expand(gf, clear);
         }
-        if (inp->s_copy_tail->ne[0] > 0) {
-            field.extra = ggml_get_rows(ctx0, cache, inp->s_copy_tail);
+        auto * ids = features ? (inp->mamba_move ? inp->s_copy : nullptr) : inp->s_copy_tail;
+        if (ids && ids->ne[0] > 0) {
+            field.extra = ggml_get_rows(ctx0, cache, ids);
             ggml_build_forward_expand(gf, field.extra);
         }
     }
 
-    auto * ids = inp->s_copy_main;
-    auto * counts = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, history.count, ids), n_seqs);
-    auto * ids_counts = ggml_concat(ctx0, ids, counts, 1);
-    auto * out = ggml_ssm_scan_replay(ctx0, checkpoint, x, dt, A, B, C, ids_counts,
-                                     history.x, history.dt, history.b, window);
+    ggml_tensor * out;
+    const int64_t n_write = inp->ckpt_dst ? inp->ckpt_dst->ne[0] : 0;
+    if (inp->verify_ids) {
+        out = ggml_ssm_scan_replay_verify(ctx0, checkpoint, x, dt, A, B, C, inp->verify_ids,
+                                          history.x, history.dt, history.b, window, n_write);
+        // The scan must read the old slots before a relocation overwrites them.
+        ggml_build_forward_expand(gf, out);
+    } else {
+        auto * ids = inp->s_copy_main;
+        auto * counts = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, history.count, ids), n_seqs);
+        auto * ids_counts = ggml_concat(ctx0, ids, counts, 1);
+        out = ggml_ssm_scan_replay(ctx0, checkpoint, x, dt, A, B, C, ids_counts,
+                                   history.x, history.dt, history.b, window);
+    }
 
     size_t offset = ggml_nelements(x)*ggml_element_size(out);
     for (const auto & field : fields) {
         auto * cache = field.cache;
+        if (!cache) {
+            continue;
+        }
+        if (cache == checkpoint && inp->verify_ids) {
+            if (n_write) {
+                const size_t stride = ggml_row_size(out->type, cache->ne[0]);
+                auto * src = ggml_view_2d(ctx0, out, cache->ne[0], n_write, stride, offset);
+                ggml_format_name(src, "ssm_replay_checkpoint-%d", il);
+                ggml_build_forward_expand(gf, ggml_set_rows(ctx0, cache, src, inp->ckpt_dst));
+                offset += stride*n_write;
+            }
+            continue;
+        }
+        if (inp->verify_ids) {
+            if (!field.extra && !inp->feature_dst) {
+                continue;
+            }
+            const int64_t n_rs = mctx->get_n_rs();
+            auto * slots = ggml_view_2d(ctx0, cache, cache->ne[0], n_rs, cache->nb[1], head*cache->nb[1]);
+            if (field.extra) {
+                slots = ggml_cpy(ctx0, field.extra, slots);
+                ggml_build_forward_expand(gf, slots);
+            }
+            if (inp->feature_dst) {
+                const int64_t capacity = window + inp->n_pend;
+                const int64_t width = cache->ne[0]/capacity;
+                const size_t stride = ggml_row_size(out->type, width);
+                auto * rows = ggml_view_2d(ctx0, out, width, inp->feature_dst->ne[0], stride, offset);
+                auto * dst = ggml_reshape_2d(ctx0, slots, width, capacity*n_rs);
+                ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst, rows, inp->feature_dst));
+                offset += stride*inp->feature_dst->ne[0];
+            }
+            continue;
+        }
         const size_t stride = ggml_row_size(out->type, cache->ne[0]);
         auto * src = ggml_view_2d(ctx0, out, cache->ne[0], n_seqs, stride, offset);
         auto * dst = ggml_view_2d(ctx0, cache, cache->ne[0], n_seqs, cache->nb[1], head*cache->nb[1]);
@@ -200,6 +248,9 @@ static ggml_tensor * build_mamba2_replay(ggml_context * ctx0, ggml_cgraph * gf, 
     if (inp->s_copy_tail->ne[0] > 0) {
         for (const auto & field : fields) {
             auto * cache = field.cache;
+            if (!cache || (inp->verify_ids && cache != checkpoint)) {
+                continue;
+            }
             auto * src = ggml_view_2d(ctx0, field.extra, cache->ne[0], n_extra, field.extra->nb[1],
                                       (field.extra->ne[1] - n_extra)*field.extra->nb[1]);
             auto * dst = ggml_view_2d(ctx0, cache, cache->ne[0], n_extra, cache->nb[1], (head + n_seqs)*cache->nb[1]);
@@ -207,55 +258,6 @@ static ggml_tensor * build_mamba2_replay(ggml_context * ctx0, ggml_cgraph * gf, 
         }
     }
     return out;
-}
-
-ggml_tensor * llm_build_mamba_base::build_mamba2_verify(llm_graph_input_rs * inp, int il, ggml_tensor * x, ggml_tensor * dt,
-                                                        ggml_tensor * A, ggml_tensor * B, ggml_tensor * C) const {
-    const auto * mctx = inp->mctx;
-    const auto & history = mctx->get_mamba_replay(il);
-    const int64_t n_seqs = x->ne[3];
-    const int64_t n_pend = inp->n_pend;
-    const int64_t n_store = std::min(x->ne[2], n_pend);
-    ggml_tensor * s = mctx->get_s_l(il);
-    const auto gather = [&](ggml_tensor * cache, int64_t dim, int64_t heads) {
-        auto * rows = build_rs(inp, cache, cache->ne[0], n_seqs);
-        return ggml_reshape_4d(ctx0, rows, dim, heads, n_pend, n_seqs);
-    };
-    auto * px = gather(history.x, x->ne[0], x->ne[1]);
-    auto * pB = gather(history.b, B->ne[0], B->ne[1]);
-    auto * pd = ggml_reshape_3d(ctx0, gather(history.dt, dt->ne[0], 1), dt->ne[0], n_pend, n_seqs);
-
-    const auto replay = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor *) {
-        auto * state = ggml_reshape_4d(ctx, states, B->ne[0], x->ne[0], x->ne[1], states->ne[1]);
-        // Only the final state is consumed. B can stand in for the unused readout C.
-        auto * scan = ggml_ssm_scan(ctx, state, px, pd, A, pB, pB, inp->rep_ids, 1);
-        cb(scan, "ssm_replay_prefix", il);
-        return ggml_view_4d(ctx, scan, state->ne[0], state->ne[1], state->ne[2], n_seqs,
-                            state->nb[1], state->nb[2], state->nb[3], ggml_nbytes(px));
-    };
-    auto * committed = build_rs(inp, s, s->ne[0], n_seqs, replay);
-    // Full lengths keep long prompts on the same sequential scan as rollback with state snapshots.
-    auto * scan = ggml_ssm_scan(ctx0, committed, x, dt, A, B, C, inp->seq_ids, 1);
-    ggml_build_forward_expand(gf, scan);
-
-    const bool keep = rs_replay_keep();
-    auto * end = ggml_view_2d(ctx0, keep ? committed : scan, s->ne[0], n_seqs, s->nb[1],
-                             keep ? 0 : ggml_nelements(x)*sizeof(float));
-    auto * dst = ggml_view_2d(ctx0, s, s->ne[0], n_seqs, s->nb[1], mctx->get_head()*s->nb[1]);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, end, dst));
-
-    // Store the biased dt before softplus so replay uses the same scan as verification.
-    const auto store = [&](ggml_tensor * cache, ggml_tensor * input) {
-        auto * src = ggml_view_4d(ctx0, input, input->ne[0], input->ne[1], n_store, n_seqs,
-                                  input->nb[1], input->nb[2], input->nb[3], 0);
-        auto * dst = ggml_view_3d(ctx0, cache, input->ne[0]*input->ne[1], n_store, n_seqs, cache->nb[1]/n_pend,
-                                  cache->nb[1], mctx->get_head()*cache->nb[1]);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
-    };
-    store(history.x,  x);
-    store(history.dt, ggml_reshape_4d(ctx0, dt, dt->ne[0], 1, dt->ne[1], dt->ne[2]));
-    store(history.b,  B);
-    return scan;
 }
 
 ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
@@ -310,7 +312,7 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         // => {d_conv - 1 + n_seq_tokens, d_inner + 2*n_group*d_state, n_seqs}
         ggml_tensor * conv_x;
         const int64_t channels = d_inner + 2*n_group*d_state;
-        if (inp->seq_ids) {
+        if (inp->verify_ids) {
             conv_x = build_conv_state_replay(inp, conv_states_all, xBC, d_conv - 1, channels, il);
         } else {
             ggml_tensor * conv = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
@@ -364,9 +366,7 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         };
 
         ggml_tensor * y_ssm;
-        if (inp->seq_ids) {
-            y_ssm = build_mamba2_verify(inp, il, x, dt, A, B, C);
-        } else if (mctx_cur->get_mamba_replay(il).x) {
+        if (mctx_cur->get_mamba_replay(il).x) {
             y_ssm = build_mamba2_replay(ctx0, gf, inp, il, x, dt, A, B, C, cparams.ssm_replay_window);
         } else {
             y_ssm = build_rs(inp, ssm_states_all, ssm_states_all->ne[0], ubatch.n_seqs, get_ssm_rows);

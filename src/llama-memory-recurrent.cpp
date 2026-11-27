@@ -20,8 +20,10 @@
 
 // State data layout: 0 is ordinary, 1 is transposed, 2 adds separate Mamba replay tensors.
 static constexpr uint32_t MAMBA_REPLAY_LAYOUT = 2;
-static constexpr uint32_t MAMBA_VERIFY_FULL_ROWS = 3;
-static constexpr uint32_t MAMBA_VERIFY_LAYOUT = 4;
+static constexpr uint32_t MAMBA_VERIFY_LAST_BLOCK_DEVICE = 3;
+static constexpr uint32_t MAMBA_VERIFY_LAST_BLOCK = 4;
+static constexpr uint32_t MAMBA_VERIFY_FULL_ROWS = 5;
+static constexpr uint32_t MAMBA_VERIFY_LAYOUT = 6;
 
 // Each row is [features, time]. The convolution's committed columns precede the pending inputs.
 static size_t mamba_verify_prefix_bytes(const ggml_tensor * t, uint32_t window, uint32_t pending, uint32_t n_conv) {
@@ -52,6 +54,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     rs_idx.assign(n_seq_max, 0);
 
     const bool replay = replay_window > 0 && (n_rs_seq == 0 || this->rs_replay) && type_s == GGML_TYPE_F32 && hparams.ssm_n_group > 0;
+    const uint64_t history_size = (uint64_t) replay_window + (this->rs_replay ? (uint64_t) n_rs_seq + 1 : 0);
 
     cells.clear();
     cells.resize(mem_size);
@@ -135,13 +138,13 @@ llama_memory_recurrent::llama_memory_recurrent(
             if (n_head == 0 || d_inner == 0 || d_state == 0 || d_inner % n_head != 0 || n_head % n_group != 0 || d_state * d_inner >= INT32_MAX) {
                 throw std::runtime_error("invalid ReplaySSM state dimensions");
             }
-            if (d_state * d_inner + replay_window * (d_inner + n_head + d_state * n_group) + 1 > INT32_MAX) {
+            if (d_state * d_inner + history_size * (d_inner + n_head + d_state * n_group) + 1 > INT32_MAX) {
                 throw std::runtime_error("ReplaySSM state row is too large");
             }
             auto & history = mamba_replay_l[i];
-            history.x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, replay_window*d_inner,         mem_size);
-            history.dt    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, replay_window*n_head,          mem_size);
-            history.b     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, replay_window*d_state*n_group, mem_size);
+            history.x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, history_size*d_inner,         mem_size);
+            history.dt    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, history_size*n_head,          mem_size);
+            history.b     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, history_size*d_state*n_group, mem_size);
             ggml_format_name(history.x,     "cache_mamba_x_l%d",     i);
             ggml_format_name(history.dt,    "cache_mamba_dt_l%d",    i);
             ggml_format_name(history.b,     "cache_mamba_b_l%d",     i);
@@ -228,6 +231,8 @@ void llama_memory_recurrent::clear(bool data) {
         cells[i].rs_max = 0;
         cells[i].rs_pend = 0;
         cells[i].rs_rep = 0;
+        cells[i].mamba_pend = 0;
+        cells[i].mamba_rep  = 0;
     }
 
     head = 0;
@@ -292,6 +297,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     if (rs_replay) {
                         // the next ubatch replays only the kept pending tokens
                         cell.rs_pend -= rollback;
+                        if (mamba_replay_window) {
+                            cell.mamba_pend -= rollback;
+                        }
                         cell.rs_max = 0;
                     } else {
                         set_rs_idx(seq_id, (uint32_t) rollback);
@@ -701,6 +709,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 empty_cell.pos = orig_cell.pos;
                 empty_cell.src = orig_cell.src;
                 empty_cell.rs_pend = orig_cell.rs_pend;
+                empty_cell.mamba_pend = orig_cell.mamba_pend;
                 orig_cell.seq_id.erase(seq_id);
                 empty_cell.seq_id.insert(seq_id); // will be overwritten
                 GGML_ASSERT(!orig_cell.is_empty()); // has at least one remaining seq_id
@@ -733,6 +742,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.rs_max, src_cell.rs_max);
             std::swap(dst_cell.rs_pend, src_cell.rs_pend);
+            std::swap(dst_cell.mamba_pend, src_cell.mamba_pend);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
             // the cell moved out only gets its final state copied, its rollback snapshots stay behind
             if (!rs_replay) {
@@ -770,6 +780,11 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             // replay what the last ubatch left pending, then keep this ubatch pending if it can be rolled back
             cell.rs_rep  = cell.src >= 0 ? cell.rs_pend : 0;
             cell.rs_pend = cell.rs_max > 0 ? n_seq_tokens : 0;
+            if (mamba_replay_window) {
+                cell.mamba_rep = cell.src >= 0 ? cell.mamba_pend : 0;
+                cell.mamba_pend = n_seq_tokens > n_rs_seq + 1 ? 0 :
+                    n_seq_tokens + (cell.mamba_rep + n_seq_tokens > mamba_replay_window ? 0 : cell.mamba_rep);
+            }
         }
         cell.seq_id.clear();
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
@@ -897,7 +912,7 @@ size_t llama_memory_recurrent::size_p_bytes() const {
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
-    std::vector<uint32_t> pending;
+    std::vector<std::array<uint32_t, 2>> pending;
     uint32_t cell_count = 0;
 
     // Count the number of cells with the specified seq_id
@@ -909,7 +924,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
         if ((seq_id == -1 && !cell.is_empty()) || cell.has_seq_id(seq_id)) {
             ++cell_count;
             if (mamba_replay_window && rs_replay) {
-                pending.push_back(cell.rs_pend);
+                pending.push_back({cell.rs_pend, cell.mamba_pend});
             }
             uint32_t rs_idx_cur = 0;
 
@@ -1030,7 +1045,7 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
 }
 
 void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
-                                              const std::vector<uint32_t> & pending, llama_state_seq_flags flags) const {
+                                              const std::vector<std::array<uint32_t, 2>> & pending, llama_state_seq_flags flags) const {
     // Device snapshots reuse fixed-size buffers. Portable snapshots contain only the committed convolution and pending inputs.
     const uint32_t verify_layout = (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) ? MAMBA_VERIFY_FULL_ROWS : MAMBA_VERIFY_LAYOUT;
     const uint32_t layout  = mamba_replay_window ? (rs_replay ? verify_layout : MAMBA_REPLAY_LAYOUT) : 0;
@@ -1040,10 +1055,10 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
     io.write(&layout, sizeof(layout));
     io.write(&n_layer, sizeof(n_layer));
     if (!pending.empty()) {
-        io.write(pending.data(), pending.size()*sizeof(uint32_t));
+        io.write(pending.data(), pending.size()*sizeof(pending.front()));
     }
 
-    const auto write_rows = [&](ggml_tensor * t, uint32_t n_conv) {
+    const auto write_rows = [&](ggml_tensor * t, uint32_t n_conv, bool features) {
         size_t logical = 0;
         for (const auto & range : cell_ranges) {
             if (layout != MAMBA_VERIFY_LAYOUT) {
@@ -1051,7 +1066,8 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
                 continue;
             }
             for (uint32_t row = range.first; row < range.second; ++row) {
-                const size_t bytes = mamba_verify_prefix_bytes(t, mamba_replay_window, pending[logical++], n_conv);
+                const uint32_t window = n_rs_seq + 1 + (features ? mamba_replay_window : 0);
+                const size_t bytes = mamba_verify_prefix_bytes(t, window, pending[logical++][features], n_conv);
                 if (bytes) {
                     io.write_tensor(t, row*t->nb[1], bytes);
                 }
@@ -1075,7 +1091,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
 
         // Write each logical cell row range. With pending recurrent rollback,
         // the logical current state may live in a rollback snapshot plane.
-        write_rows(r_l[il], hparams.ssm_d_conv - 1);
+        write_rows(r_l[il], hparams.ssm_d_conv - 1, false);
 
         // the PLE conv history is a second recurrent row, so it has to travel with the first
         if (p_l[il] != nullptr) {
@@ -1151,7 +1167,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
                 const uint64_t size_row = t->nb[1];
                 io.write(&size_row, sizeof(size_row));
 
-                write_rows(t, 0);
+                write_rows(t, 0, true);
             }
         }
     }
@@ -1289,30 +1305,51 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
     }
     const bool s_trans = layout == 1;
     const uint32_t expected = mamba_replay_window ? (rs_replay ? MAMBA_VERIFY_LAYOUT : MAMBA_REPLAY_LAYOUT) : 0;
+    const bool last_block = layout == MAMBA_VERIFY_LAST_BLOCK && expected == MAMBA_VERIFY_LAYOUT;
+    if (layout == MAMBA_VERIFY_LAST_BLOCK_DEVICE && expected == MAMBA_VERIFY_LAYOUT) {
+        LLAMA_LOG_ERROR("%s: the one-block device snapshot has incompatible ReplaySSM history buffers\n", __func__);
+        return false;
+    }
     if (layout != expected && !(layout == 0 && expected == MAMBA_REPLAY_LAYOUT) &&
-        !(layout == MAMBA_VERIFY_FULL_ROWS && expected == MAMBA_VERIFY_LAYOUT)) {
+        !(layout == MAMBA_VERIFY_FULL_ROWS && expected == MAMBA_VERIFY_LAYOUT) && !last_block) {
         LLAMA_LOG_ERROR("%s: incompatible recurrent cache layout %u\n", __func__, layout);
         return false;
     }
-    if (layout == MAMBA_VERIFY_LAYOUT && (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+    if ((layout == MAMBA_VERIFY_LAYOUT || last_block) && (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
         LLAMA_LOG_ERROR("%s: expected a device ReplaySSM snapshot\n", __func__);
         return false;
     }
     if (expected == MAMBA_VERIFY_LAYOUT) {
         for (uint32_t i = head; i < head + cell_count; ++i) {
             io.read(&cells[i].rs_pend, sizeof(cells[i].rs_pend));
-            if (cells[i].rs_pend > mamba_replay_window) {
+            if (last_block) {
+                cells[i].mamba_pend = cells[i].rs_pend;
+            } else {
+                io.read(&cells[i].mamba_pend, sizeof(cells[i].mamba_pend));
+            }
+            if (cells[i].rs_pend > n_rs_seq + 1 || cells[i].rs_pend > cells[i].mamba_pend ||
+                cells[i].mamba_pend > std::max(mamba_replay_window, n_rs_seq + 1)) {
                 LLAMA_LOG_ERROR("%s: invalid pending ReplaySSM length\n", __func__);
                 return false;
             }
         }
     }
 
-    const auto read_rows = [&](ggml_tensor * t, uint32_t n_conv) {
-        if (layout == MAMBA_VERIFY_LAYOUT) {
+    const auto read_rows = [&](ggml_tensor * t, uint32_t n_conv, bool features, bool raw_dt = false) {
+        if (layout == MAMBA_VERIFY_LAYOUT || last_block) {
             for (uint32_t row = head; row < head + cell_count; ++row) {
-                const size_t bytes = mamba_verify_prefix_bytes(t, mamba_replay_window, cells[row].rs_pend, n_conv);
-                if (bytes) {
+                const uint32_t window = n_rs_seq + 1 + (features ? mamba_replay_window : 0);
+                const uint32_t pending = features ? cells[row].mamba_pend : cells[row].rs_pend;
+                const size_t bytes = mamba_verify_prefix_bytes(t, window, pending, n_conv);
+                if (bytes && raw_dt) {
+                    // The one-block portable format stored biased dt before softplus.
+                    std::vector<float> steps(bytes/sizeof(float));
+                    io.read(steps.data(), bytes);
+                    for (float & step : steps) {
+                        step = step <= 20.0f ? std::log1p(std::exp(step)) : step;
+                    }
+                    ggml_backend_tensor_set(t, steps.data(), row*t->nb[1], bytes);
+                } else if (bytes) {
                     io.read_tensor(t, row*t->nb[1], bytes);
                 }
             }
@@ -1344,7 +1381,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             return false;
         }
 
-        read_rows(r_l[il], hparams.ssm_d_conv - 1);
+        read_rows(r_l[il], hparams.ssm_d_conv - 1, false);
 
         if (p_l[il] != nullptr) {
             uint64_t p_size_row_ref;
@@ -1467,7 +1504,8 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
 
                 uint64_t size_row_ref;
                 io.read(&size_row_ref, sizeof(size_row_ref));
-                if (size_row_ref != t->nb[1]) {
+                const size_t size_row = last_block ? t->nb[1]/(mamba_replay_window + n_rs_seq + 1)*(n_rs_seq + 1) : t->nb[1];
+                if (size_row_ref != size_row) {
                     LLAMA_LOG_ERROR("%s: mismatched pending row size (%zu != %zu, layer %d)\n", __func__, t->nb[1], (size_t) size_row_ref, il);
                     return false;
                 }
@@ -1483,7 +1521,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
                     }
                     ggml_backend_tensor_set(t, counts.data(), head*t->nb[1], counts.size()*sizeof(int32_t));
                 } else {
-                    read_rows(t, 0);
+                    read_rows(t, 0, true, last_block && t == mamba_replay_l[il].dt);
                 }
             }
         }
@@ -1638,6 +1676,40 @@ bool llama_memory_recurrent_context::get_rs_replay() const {
 
 uint32_t llama_memory_recurrent_context::get_rs_rep(int i) const {
     return is_full ? 0 : mem->cells[i + mem->head].rs_rep;
+}
+
+uint32_t llama_memory_recurrent_context::get_mamba_rep(int i) const {
+    return is_full ? 0 : mem->cells[i + mem->head].mamba_rep;
+}
+
+bool llama_memory_recurrent_context::mamba_write(int i, uint32_t n_tokens) const {
+    if (is_full) {
+        return true;
+    }
+    const int32_t dst = mem->head + i;
+    const auto & cell = mem->cells[dst];
+    return cell.src0 != dst || n_tokens > mem->n_rs_seq + 1 ||
+        (cell.mamba_rep > 0 && cell.mamba_pend == n_tokens);
+}
+
+uint32_t llama_memory_recurrent_context::n_mamba_write(const llama_ubatch & ubatch) const {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < ubatch.n_seqs; ++i) {
+        n += mamba_write(i, ubatch.n_seq_tokens);
+    }
+    return n;
+}
+
+bool llama_memory_recurrent_context::mamba_move() const {
+    if (is_full) {
+        return mem->size > 1;
+    }
+    for (uint32_t i = mem->head; i < mem->head + get_n_rs(); ++i) {
+        if (mem->cells[i].src0 != (int32_t) i) {
+            return true;
+        }
+    }
+    return false;
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {

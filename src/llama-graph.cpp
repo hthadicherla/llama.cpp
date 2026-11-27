@@ -549,24 +549,38 @@ void llm_graph_input_rs::set_input_rep(const llama_memory_recurrent_context * mc
 
     const int64_t n_seqs = ubatch->n_seqs;
 
-    int32_t * reps = (int32_t *) rep_n->data;
     int32_t * cols = (int32_t *) rep_cols->data;
-
-    GGML_ASSERT(ggml_backend_buffer_is_host(rep_n->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(rep_cols->buffer));
-    if (seq_ids) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(seq_ids->buffer));
-    }
+    GGML_ASSERT(!rep_n || ggml_backend_buffer_is_host(rep_n->buffer));
+    GGML_ASSERT(!verify_ids || ggml_backend_buffer_is_host(verify_ids->buffer));
+    GGML_ASSERT(!ckpt_dst || ggml_backend_buffer_is_host(ckpt_dst->buffer));
+    GGML_ASSERT(!feature_dst || ggml_backend_buffer_is_host(feature_dst->buffer));
 
+    int32_t n_write = 0;
     for (int64_t s = 0; s < n_seqs; ++s) {
         const int64_t n_rep = mctx->get_rs_rep(s);
         GGML_ASSERT(n_rep <= n_pend);
 
-        reps[s] = n_rep;
-        if (seq_ids) {
-            int32_t * ids = (int32_t *) seq_ids->data;
-            ids[s] = s;
-            ids[n_seqs + s] = ubatch->n_seq_tokens;
+        if (verify_ids) {
+            int32_t * ids = (int32_t *) verify_ids->data;
+            ids[s] = ((const int32_t *) s_copy->data)[s];
+            const int64_t h = mctx->get_mamba_rep(s);
+            ids[n_seqs + s] = h;
+            ids[2*n_seqs + s] = -1;
+            if (mctx->mamba_write(s, ubatch->n_seq_tokens)) {
+                GGML_ASSERT(ckpt_dst && n_write < ckpt_dst->ne[0]);
+                ((int32_t *) ckpt_dst->data)[n_write] = mctx->get_head() + s;
+                ids[2*n_seqs + s] = n_write++;
+            }
+            if (feature_dst) {
+                const int64_t t = ubatch->n_seq_tokens;
+                const int64_t start = s*(mamba_window + n_pend) + (h + t <= mamba_window ? h : 0);
+                for (int64_t i = 0; i < t; ++i) {
+                    ((int64_t *) feature_dst->data)[s*t + i] = start + i;
+                }
+            }
+        } else {
+            ((int32_t *) rep_n->data)[s] = n_rep;
         }
 
         // the conv history is [window | pending]: the window after the kept tokens
@@ -581,16 +595,13 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     this->mctx = mctx;
 
-    bool res = true;
+    return can_reuse_rs(mctx, params.ubatch);
+}
 
-    res &= s_copy->ne[0] == mctx->get_n_rs();
-
-    res &= s_copy_main->ne[0] == params.ubatch.n_seqs;
-
-    res &= head == mctx->get_head();
-    res &= rs_z == mctx->get_rs_z();
-
-    return res;
+bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mctx, const llama_ubatch & ubatch) const {
+    return s_copy->ne[0] == mctx->get_n_rs() && s_copy_main->ne[0] == ubatch.n_seqs &&
+        head == mctx->get_head() && rs_z == mctx->get_rs_z() &&
+        (!verify_ids || ((ckpt_dst ? ckpt_dst->ne[0] : 0) == mctx->n_mamba_write(ubatch) && mamba_move == mctx->mamba_move()));
 }
 
 void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
@@ -1311,12 +1322,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_attn_mask(inp_attn->self_attn_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
-
-    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
-
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_rs(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1358,12 +1364,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_attn_mask(inp_attn->self_attn_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
-
-    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
-
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_rs(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1431,12 +1432,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= can_reuse_attn_mask(inp_attn->self_attn_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
-
-    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
-
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_rs(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1518,12 +1514,7 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
-
-    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
-
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_rs(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -4252,14 +4243,27 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         inp->rep_cols_r = win(n_conv_r);
         inp->rep_cols_p = n_conv_p > 0 ? win(n_conv_p) : nullptr;
 
-        inp->rep_n = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
-        ggml_set_input(inp->rep_n);
-        ggml_set_name(inp->rep_n, "rs_rep_n");
         if (cparams.ssm_replay_window) {
-            inp->rep_ids = ggml_concat(ctx0, inp->s_copy_main, inp->rep_n, 1);
-            inp->seq_ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_seqs, 2);
-            ggml_set_input(inp->seq_ids);
-            ggml_set_name(inp->seq_ids, "ssm_verify_ids");
+            inp->mamba_window = cparams.ssm_replay_window;
+            inp->mamba_move = mctx_cur->mamba_move();
+            inp->verify_ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_seqs, 3);
+            ggml_set_input(inp->verify_ids);
+            ggml_set_name(inp->verify_ids, "ssm_verify_ids");
+            if (ubatch.n_seq_tokens <= inp->n_pend) {
+                inp->feature_dst = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, ubatch.n_tokens);
+                ggml_set_input(inp->feature_dst);
+                ggml_set_name(inp->feature_dst, "ssm_feature_dst");
+            }
+            const uint32_t n_write = mctx_cur->n_mamba_write(ubatch);
+            if (n_write > 0) {
+                inp->ckpt_dst = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_write);
+                ggml_set_input(inp->ckpt_dst);
+                ggml_set_name(inp->ckpt_dst, "ssm_checkpoint_dst");
+            }
+        } else {
+            inp->rep_n = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
+            ggml_set_input(inp->rep_n);
+            ggml_set_name(inp->rep_n, "rs_rep_n");
         }
     }
 

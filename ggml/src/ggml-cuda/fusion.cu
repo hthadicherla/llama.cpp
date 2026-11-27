@@ -569,8 +569,8 @@ static int ggml_cuda_try_ssm_scan_cache_fusion(
     }
 
     const int64_t K = ggml_get_op_params_i32(ssm, 0); // snapshot slot count
-    // The accepted-prefix state can feed another scan as well as the persistent cache.
-    if (ggml_get_op_params_i32(ssm, 1) < 0) {
+    // Verification packs only the checkpoint rows selected for writeback.
+    if (ssm->src[6]->ne[1] == 3) {
         return 0;
     }
     const bool replay = ggml_get_op_params_i32(ssm, 1) > 0;

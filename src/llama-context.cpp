@@ -362,7 +362,6 @@ llama_context::llama_context(
                 throw std::runtime_error("ReplaySSM verification requires n_ubatch > n_rs_seq + 1");
             }
             cparams.rs_replay = true;
-            cparams.ssm_replay_window = cparams.n_rs_seq + 1;
         } else {
             LLAMA_LOG_WARN("%s: model does not support ReplaySSM verification; using default recurrent rollback\n", __func__);
             cparams.ssm_replay_window = 0;

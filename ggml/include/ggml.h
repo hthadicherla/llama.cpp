@@ -2315,8 +2315,6 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
-    // For Mamba-2 with K == 1, ids may be I32 [n_seqs, 2]: source slots, then the valid input lengths.
-    // Positions past a sequence's length read no inputs, leave its state unchanged and return zero output.
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,
@@ -2346,6 +2344,16 @@ extern "C" {
             struct ggml_tensor  * dt_cache,
             struct ggml_tensor  * B_cache,
             int32_t               window);
+
+    // Verify all T inputs from the accepted prefix; cache rows have window + max_verify input vectors.
+    // ids is I32 [n_seqs, 3]: source slot, accepted length, and compact checkpoint index (-1 to skip).
+    // Returns y, n_write checkpoints, then the T new x, softplus(dt) and B vectors in sequence order.
+    // T > max_verify drains the window and returns only y and final checkpoints. Each checkpoint index is unique.
+    GGML_API struct ggml_tensor * ggml_ssm_scan_replay_verify(
+            struct ggml_context * ctx, struct ggml_tensor * s, struct ggml_tensor * x, struct ggml_tensor * dt,
+            struct ggml_tensor * A, struct ggml_tensor * B, struct ggml_tensor * C, struct ggml_tensor * ids,
+            struct ggml_tensor * x_cache, struct ggml_tensor * dt_cache, struct ggml_tensor * B_cache,
+            int32_t window, int32_t n_write);
 
     // partition into non-overlapping windows with padding if needed
     // example:

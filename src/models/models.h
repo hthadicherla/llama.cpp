@@ -28,8 +28,6 @@ struct llm_build_mamba_base : public llm_graph_context {
 
     ggml_tensor * build_mamba_layer(llm_graph_input_rs * inp, ggml_tensor * cur, const llama_ubatch & ubatch, int il);
     ggml_tensor * build_mamba2_layer(llm_graph_input_rs * inp, ggml_tensor * cur, const llama_ubatch & ubatch, int il) const;
-    ggml_tensor * build_mamba2_verify(llm_graph_input_rs * inp, int il, ggml_tensor * x, ggml_tensor * dt,
-                                     ggml_tensor * A, ggml_tensor * B, ggml_tensor * C) const;
 
 };
 

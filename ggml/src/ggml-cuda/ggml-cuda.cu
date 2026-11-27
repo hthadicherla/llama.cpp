@@ -4419,8 +4419,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SSM_SCAN: {
             const int32_t K = ggml_get_op_params_i32(op, 0);
             const int32_t window = ggml_get_op_params_i32(op, 1);
-            if (window > 0) {
-                if (K != 1 || window > 32 || op->src[3]->ne[0] != 1 ||
+            if (window != 0) {
+                if (K != 1 || window < 1 || window > 32 || op->src[3]->ne[0] != 1 ||
                     op->type != GGML_TYPE_F32 || op->src[6]->type != GGML_TYPE_I32) {
                     return false;
                 }
@@ -4429,7 +4429,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         return false;
                     }
                 }
-                if (op->src[6]->ne[1] != 2 || !ggml_is_contiguous(op->src[6])) {
+                if ((op->src[6]->ne[1] != 2 && op->src[6]->ne[1] != 3) || !ggml_is_contiguous(op->src[6])) {
                     return false;
                 }
                 for (int i = 7; i <= 9; ++i) {

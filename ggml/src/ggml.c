@@ -5725,8 +5725,7 @@ struct ggml_tensor * ggml_ssm_scan(
         GGML_ASSERT(B->ne[2] == n_seq_tokens);
         GGML_ASSERT(B->ne[3] == n_seqs);
         GGML_ASSERT(ids->ne[0] == n_seqs);
-        GGML_ASSERT(ggml_is_vector(ids) ||
-            (ggml_is_matrix(ids) && ids->ne[1] == 2 && ggml_is_contiguous(ids) && A->ne[0] == 1 && K == 1));
+        GGML_ASSERT(ggml_is_vector(ids));
         GGML_ASSERT(A->ne[1] == n_head);
         GGML_ASSERT(ggml_is_matrix(A));
 
@@ -5750,13 +5749,11 @@ struct ggml_tensor * ggml_ssm_scan(
     result->src[6] = ids;
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
-    // 0 is a fixed-length scan, -1 is a prefix scan, and positive values are ReplaySSM windows.
-    ggml_set_op_params_i32(result, 1, ids->ne[1] == 2 ? -1 : 0);
 
     return result;
 }
 
-struct ggml_tensor * ggml_ssm_scan_replay(
+static struct ggml_tensor * ggml_ssm_scan_replay_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * s,
         struct ggml_tensor  * x,
@@ -5768,12 +5765,14 @@ struct ggml_tensor * ggml_ssm_scan_replay(
         struct ggml_tensor  * x_cache,
         struct ggml_tensor  * dt_cache,
         struct ggml_tensor  * B_cache,
-        int32_t               window) {
+        int32_t               window,
+        int32_t               n_write) {
+    const bool verify = n_write >= 0;
     GGML_ASSERT(window >= 1 && window <= 32);
     GGML_ASSERT(s->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && dt->type == GGML_TYPE_F32);
     GGML_ASSERT(A->type == GGML_TYPE_F32 && B->type == GGML_TYPE_F32 && C->type == GGML_TYPE_F32);
     GGML_ASSERT(ids_counts->type == GGML_TYPE_I32 && ggml_is_matrix(ids_counts) && ggml_is_contiguous(ids_counts));
-    GGML_ASSERT(ids_counts->ne[0] == x->ne[3] && ids_counts->ne[1] == 2);
+    GGML_ASSERT(ids_counts->ne[0] == x->ne[3] && ids_counts->ne[1] == (verify ? 3 : 2));
     GGML_ASSERT(ggml_is_matrix(s) && ggml_is_contiguous(s));
     GGML_ASSERT(ggml_is_3d(dt) && ggml_is_contiguous(dt));
     GGML_ASSERT(ggml_is_matrix(A) && ggml_is_contiguous(A));
@@ -5793,17 +5792,21 @@ struct ggml_tensor * ggml_ssm_scan_replay(
     GGML_ASSERT(s->ne[0] == n_state);
     struct ggml_tensor * caches[] = { x_cache, dt_cache, B_cache };
     const int64_t widths[] = { d_inner, n_head, d_state*n_group };
-    int64_t n_out_row = n_state + 1; // checkpoint and pending count
+    const int64_t capacity = x_cache->ne[0] / d_inner;
+    GGML_ASSERT(verify ? capacity > window && n_write <= x->ne[3] : capacity == window);
+    GGML_ASSERT(!verify || x->ne[2] <= capacity - window || n_write == x->ne[3]);
+    const int64_t n_features = !verify ? capacity : x->ne[2] <= capacity - window ? x->ne[2] : 0;
+    int64_t n_out = ggml_nelements(x) + (verify ? n_write*n_state : x->ne[3]*(n_state + 1));
     for (int i = 0; i < 3; ++i) {
         GGML_ASSERT(caches[i]->type == GGML_TYPE_F32 && ggml_is_matrix(caches[i]) && ggml_is_contiguous(caches[i]));
-        GGML_ASSERT(caches[i]->ne[0] == window*widths[i] && caches[i]->ne[1] == s->ne[1]);
-        n_out_row += caches[i]->ne[0];
+        GGML_ASSERT(caches[i]->ne[0] == capacity*widths[i] && caches[i]->ne[1] == s->ne[1]);
+        n_out += x->ne[3]*n_features*widths[i];
     }
     GGML_ASSERT(dt->ne[0] == n_head && dt->ne[1] == x->ne[2] && dt->ne[2] == x->ne[3]);
     GGML_ASSERT(A->ne[0] == 1 && A->ne[1] == n_head);
     GGML_ASSERT(B->ne[2] == x->ne[2] && B->ne[3] == x->ne[3]);
 
-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(x) + n_out_row*x->ne[3]);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_out);
     result->op     = GGML_OP_SSM_SCAN;
     result->src[0] = s;
     result->src[1] = x;
@@ -5817,7 +5820,24 @@ struct ggml_tensor * ggml_ssm_scan_replay(
     result->src[9] = B_cache;
     ggml_set_op_params_i32(result, 0, 1); // one updated state row per sequence
     ggml_set_op_params_i32(result, 1, window);
+    ggml_set_op_params_i32(result, 2, n_write);
     return result;
+}
+
+struct ggml_tensor * ggml_ssm_scan_replay(
+        struct ggml_context * ctx, struct ggml_tensor * s, struct ggml_tensor * x, struct ggml_tensor * dt,
+        struct ggml_tensor * A, struct ggml_tensor * B, struct ggml_tensor * C, struct ggml_tensor * ids,
+        struct ggml_tensor * x_cache, struct ggml_tensor * dt_cache, struct ggml_tensor * B_cache, int32_t window) {
+    return ggml_ssm_scan_replay_impl(ctx, s, x, dt, A, B, C, ids, x_cache, dt_cache, B_cache, window, -1);
+}
+
+struct ggml_tensor * ggml_ssm_scan_replay_verify(
+        struct ggml_context * ctx, struct ggml_tensor * s, struct ggml_tensor * x, struct ggml_tensor * dt,
+        struct ggml_tensor * A, struct ggml_tensor * B, struct ggml_tensor * C, struct ggml_tensor * ids,
+        struct ggml_tensor * x_cache, struct ggml_tensor * dt_cache, struct ggml_tensor * B_cache,
+        int32_t window, int32_t n_write) {
+    GGML_ASSERT(n_write >= 0);
+    return ggml_ssm_scan_replay_impl(ctx, s, x, dt, A, B, C, ids, x_cache, dt_cache, B_cache, window, n_write);
 }
 
 // ggml_win_part

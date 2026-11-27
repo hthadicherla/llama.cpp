@@ -328,8 +328,11 @@ public:
     int64_t       n_conv   = 0;       // conv window columns, the widest conv of the model
     int64_t       n_pend   = 0;       // pending slots per seq
     ggml_tensor * rep_n    = nullptr; // I32 [n_seqs], kept pending tokens
-    ggml_tensor * rep_ids  = nullptr; // Mamba-2 source slots and retained lengths
-    ggml_tensor * seq_ids  = nullptr; // gathered Mamba-2 slots and lengths of the new verification block
+    ggml_tensor * verify_ids = nullptr; // Mamba-2 source slots, accepted lengths and packed checkpoint rows
+    ggml_tensor * ckpt_dst   = nullptr; // destination slots of the checkpoints updated by this ubatch
+    ggml_tensor * feature_dst = nullptr; // feature rows indexed relative to the first active slot
+    int64_t       mamba_window = 0;
+    bool          mamba_move = false;
     ggml_tensor * rep_cols = nullptr; // I32 [n_conv, n_seqs], conv history columns of the window after the kept tokens
 
     // views of rep_cols for the delta-net conv and the PLE conv windows, computed once per graph and shared across layers
@@ -337,6 +340,7 @@ public:
     ggml_tensor * rep_cols_p = nullptr;
 
     void set_input_rep(const llama_memory_recurrent_context * mctx, const llama_ubatch * ubatch);
+    bool can_reuse_rs(const llama_memory_recurrent_context * mctx, const llama_ubatch & ubatch) const;
 
     const llama_memory_recurrent_context * mctx;
 

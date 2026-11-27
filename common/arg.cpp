@@ -2452,7 +2452,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--replayssm-buffer-len"}, "N",
-        string_format("autoregressive ReplaySSM window, 1..32; verification uses the rollback depth plus one; requires --use-replayssm (default: %d)", params.replayssm_buffer_len),
+        string_format("ReplaySSM window, 1..32; requires --use-replayssm (default: %d)", params.replayssm_buffer_len),
         [](common_params & params, int value) {
             if (value < 1 || value > 32) {
                 throw std::invalid_argument("ReplaySSM window must be between 1 and 32");
