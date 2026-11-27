@@ -434,6 +434,7 @@ extern "C" {
         GGML_OP_SLEEP,
 
         GGML_OP_SIGMOID_BACK,
+        GGML_OP_SSM_REPLAY_CHECKPOINT,
 
         GGML_OP_COUNT,
     };
@@ -2345,15 +2346,20 @@ extern "C" {
             struct ggml_tensor  * B_cache,
             int32_t               window);
 
-    // Verify all T inputs from the accepted prefix; cache rows have window + max_verify input vectors.
-    // ids is I32 [n_seqs, 3]: source slot, accepted length, and compact checkpoint index (-1 to skip).
-    // Returns y, n_write checkpoints, then the T new x, softplus(dt) and B vectors in sequence order.
-    // T > max_verify drains the window and returns only y and final checkpoints. Each checkpoint index is unique.
+    // Fold prior accepted inputs into s in-place when this batch overflows the window or is a long prefill.
+    // s and the three histories are in active sequence order; counts contains one accepted length per sequence.
+    GGML_API struct ggml_tensor * ggml_ssm_replay_checkpoint(
+            struct ggml_context * ctx, struct ggml_tensor * s, struct ggml_tensor * A, struct ggml_tensor * counts,
+            struct ggml_tensor * x_cache, struct ggml_tensor * dt_cache, struct ggml_tensor * B_cache,
+            int32_t window, int64_t n_tokens);
+
+    // Read the checkpoint view and produce y plus the T new x, softplus(dt) and B vectors in sequence order.
+    // T > max_verify uses the ordinary scan and returns y and final states. Cache capacity is window + max_verify.
     GGML_API struct ggml_tensor * ggml_ssm_scan_replay_verify(
             struct ggml_context * ctx, struct ggml_tensor * s, struct ggml_tensor * x, struct ggml_tensor * dt,
-            struct ggml_tensor * A, struct ggml_tensor * B, struct ggml_tensor * C, struct ggml_tensor * ids,
+            struct ggml_tensor * A, struct ggml_tensor * B, struct ggml_tensor * C, struct ggml_tensor * counts,
             struct ggml_tensor * x_cache, struct ggml_tensor * dt_cache, struct ggml_tensor * B_cache,
-            int32_t window, int32_t n_write);
+            int32_t window);
 
     // partition into non-overlapping windows with padding if needed
     // example:

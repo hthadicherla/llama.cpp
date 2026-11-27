@@ -66,6 +66,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    std::map<ggml_backend_dev_t, ggml_backend_buffer_type_t> replay_bufts;
 
     // create a context for each buffer type
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
@@ -80,7 +81,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
             ggml_context * ctx = ggml_init(params);
             if (!ctx) {
-                return nullptr;
+                throw std::runtime_error("failed to create ggml context for rs cache");
             }
 
             ctx_map.emplace(buft, ctx);
@@ -119,9 +120,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         LLAMA_LOG_DEBUG("%s, layer %3d: dev = %s\n", __func__, i, dev_name);
 
         ggml_context * ctx = ctx_for_buft(buft);
-        if (!ctx) {
-            throw std::runtime_error("failed to create ggml context for rs cache");
-        }
+        ggml_context * ctx_s = ctx;
 
         // rs_replay: r is the conv history [channels, d_conv - 1 + n_pend], the window then the pending columns,
         // and spk, spv, spgb hold the gdn k, v, gate and beta of up to n_pend pending tokens
@@ -141,10 +140,22 @@ llama_memory_recurrent::llama_memory_recurrent(
             if (d_state * d_inner + history_size * (d_inner + n_head + d_state * n_group) + 1 > INT32_MAX) {
                 throw std::runtime_error("ReplaySSM state row is too large");
             }
+            if (offload && this->rs_replay) {
+                // The checkpoint is updated in-place, so its cache must live on a backend that can fold it.
+                auto * dev = model.dev_layer(i);
+                auto & replay_buft = replay_bufts[dev];
+                if (!replay_buft) {
+                    replay_buft = model.select_mamba_replay_buft(dev, mem_size, replay_window, n_pend);
+                    if (replay_buft != buft) {
+                        LLAMA_LOG_INFO("%s: %s does not support ReplaySSM checkpoints for this model, using CPU for the SSM cache\n", __func__, dev_name);
+                    }
+                }
+                ctx_s = ctx_for_buft(replay_buft);
+            }
             auto & history = mamba_replay_l[i];
-            history.x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, history_size*d_inner,         mem_size);
-            history.dt    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, history_size*n_head,          mem_size);
-            history.b     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, history_size*d_state*n_group, mem_size);
+            history.x     = ggml_new_tensor_2d(ctx_s, GGML_TYPE_F32, history_size*d_inner,         mem_size);
+            history.dt    = ggml_new_tensor_2d(ctx_s, GGML_TYPE_F32, history_size*n_head,          mem_size);
+            history.b     = ggml_new_tensor_2d(ctx_s, GGML_TYPE_F32, history_size*d_state*n_group, mem_size);
             ggml_format_name(history.x,     "cache_mamba_x_l%d",     i);
             ggml_format_name(history.dt,    "cache_mamba_dt_l%d",    i);
             ggml_format_name(history.b,     "cache_mamba_b_l%d",     i);
@@ -158,7 +169,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         const uint32_t n_rows = mem_size * (this->rs_replay ? 1 : 1 + n_rs_seq);
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, n_embd_r, n_rows);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx_s, type_s, hparams.n_embd_s(), n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
@@ -1680,24 +1691,6 @@ uint32_t llama_memory_recurrent_context::get_rs_rep(int i) const {
 
 uint32_t llama_memory_recurrent_context::get_mamba_rep(int i) const {
     return is_full ? 0 : mem->cells[i + mem->head].mamba_rep;
-}
-
-bool llama_memory_recurrent_context::mamba_write(int i, uint32_t n_tokens) const {
-    if (is_full) {
-        return true;
-    }
-    const int32_t dst = mem->head + i;
-    const auto & cell = mem->cells[dst];
-    return cell.src0 != dst || n_tokens > mem->n_rs_seq + 1 ||
-        (cell.mamba_rep > 0 && cell.mamba_pend == n_tokens);
-}
-
-uint32_t llama_memory_recurrent_context::n_mamba_write(const llama_ubatch & ubatch) const {
-    uint32_t n = 0;
-    for (uint32_t i = 0; i < ubatch.n_seqs; ++i) {
-        n += mamba_write(i, ubatch.n_seq_tokens);
-    }
-    return n;
 }
 
 bool llama_memory_recurrent_context::mamba_move() const {

@@ -2108,6 +2108,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_ssm_scan(params, tensor);
             } break;
+        case GGML_OP_SSM_REPLAY_CHECKPOINT:
+            {
+                ggml_compute_forward_ssm_replay_checkpoint(params, tensor);
+            } break;
         case GGML_OP_WIN_PART:
             {
                 ggml_compute_forward_win_part(params, tensor);
@@ -2494,6 +2498,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
+        case GGML_OP_SSM_REPLAY_CHECKPOINT:
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 n_tasks = n_threads;
@@ -3086,6 +3091,11 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_CROSS_ENTROPY_LOSS:
                     {
                         cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
+                    } break;
+                case GGML_OP_SSM_REPLAY_CHECKPOINT:
+                    {
+                        const int64_t heads = node->src[1]->ne[1];
+                        cur = sizeof(float)*(node->ne[0]/heads)*MIN(n_tasks, node->ne[1]*heads);
                     } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {

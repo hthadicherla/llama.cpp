@@ -160,84 +160,73 @@ static ggml_tensor * build_mamba2_replay(ggml_context * ctx0, ggml_cgraph * gf, 
     const int64_t head = mctx->get_head();
     const int32_t zero = mctx->get_rs_z();
 
+    if (inp->mamba_window) {
+        if (zero >= 0) {
+            auto * row = ggml_view_1d(ctx0, checkpoint, checkpoint->ne[0], zero*checkpoint->nb[1]);
+            ggml_build_forward_expand(gf, ggml_fill_inplace(ctx0, row, 0));
+        }
+        const auto active = [&](ggml_tensor * cache) {
+            auto * slots = ggml_view_2d(ctx0, cache, cache->ne[0], mctx->get_n_rs(), cache->nb[1], head*cache->nb[1]);
+            if (inp->mamba_move) {
+                // Snapshot the whole permutation before overwriting its active slots or inactive tail.
+                slots = ggml_cpy(ctx0, ggml_get_rows(ctx0, cache, inp->s_copy), slots);
+            }
+            return ggml_view_2d(ctx0, slots, slots->ne[0], n_seqs, slots->nb[1], 0);
+        };
+        auto * state = active(checkpoint);
+        ggml_tensor * features[] = {active(history.x), active(history.dt), active(history.b)};
+        state = ggml_ssm_replay_checkpoint(ctx0, state, A, inp->rep_n, features[0], features[1], features[2], window, x->ne[2]);
+        auto * out = ggml_ssm_scan_replay_verify(ctx0, state, x, dt, A, B, C, inp->rep_n,
+                                                 features[0], features[1], features[2], window);
+        size_t offset = ggml_nelements(x)*ggml_element_size(out);
+        if (inp->feature_dst) {
+            const int64_t capacity = window + inp->n_pend;
+            for (auto * cache : features) {
+                const int64_t width = cache->ne[0]/capacity;
+                const size_t stride = ggml_row_size(out->type, width);
+                auto * rows = ggml_view_2d(ctx0, out, width, inp->feature_dst->ne[0], stride, offset);
+                auto * dst = ggml_reshape_2d(ctx0, cache, width, capacity*n_seqs);
+                ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst, rows, inp->feature_dst));
+                offset += stride*inp->feature_dst->ne[0];
+            }
+        } else {
+            // A long prefill leaves its final state in the checkpoint and starts the next window empty.
+            auto * final = ggml_view_2d(ctx0, out, state->ne[0], n_seqs, state->nb[1], offset);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, final, state));
+        }
+        return out;
+    }
+
     struct {
         ggml_tensor * cache;
         ggml_tensor * extra;
     } fields[] = {{checkpoint, nullptr}, {history.x, nullptr}, {history.dt, nullptr},
                   {history.b, nullptr}, {history.count, nullptr}};
 
-    // Gather sources before any overlapping slot moves or verifier writes.
+    // Read every inactive source before any active destination can overwrite it.
     for (auto & field : fields) {
         auto * cache = field.cache;
-        if (!cache) {
-            continue;
-        }
-        const bool features = inp->verify_ids && cache != checkpoint;
-        if (zero >= 0 && !features) {
+        if (zero >= 0) {
             auto * row = ggml_view_1d(ctx0, cache, cache->ne[0], zero*cache->nb[1]);
             auto * clear = cache == history.count ? ggml_cpy(ctx0, ggml_arange(ctx0, 0, 1, 1), row)
                                                   : ggml_fill_inplace(ctx0, row, 0);
             ggml_build_forward_expand(gf, clear);
         }
-        auto * ids = features ? (inp->mamba_move ? inp->s_copy : nullptr) : inp->s_copy_tail;
-        if (ids && ids->ne[0] > 0) {
-            field.extra = ggml_get_rows(ctx0, cache, ids);
+        if (inp->s_copy_tail->ne[0] > 0) {
+            field.extra = ggml_get_rows(ctx0, cache, inp->s_copy_tail);
             ggml_build_forward_expand(gf, field.extra);
         }
     }
 
-    ggml_tensor * out;
-    const int64_t n_write = inp->ckpt_dst ? inp->ckpt_dst->ne[0] : 0;
-    if (inp->verify_ids) {
-        out = ggml_ssm_scan_replay_verify(ctx0, checkpoint, x, dt, A, B, C, inp->verify_ids,
-                                          history.x, history.dt, history.b, window, n_write);
-        // The scan must read the old slots before a relocation overwrites them.
-        ggml_build_forward_expand(gf, out);
-    } else {
-        auto * ids = inp->s_copy_main;
-        auto * counts = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, history.count, ids), n_seqs);
-        auto * ids_counts = ggml_concat(ctx0, ids, counts, 1);
-        out = ggml_ssm_scan_replay(ctx0, checkpoint, x, dt, A, B, C, ids_counts,
-                                   history.x, history.dt, history.b, window);
-    }
+    auto * ids = inp->s_copy_main;
+    auto * counts = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, history.count, ids), n_seqs);
+    auto * ids_counts = ggml_concat(ctx0, ids, counts, 1);
+    auto * out = ggml_ssm_scan_replay(ctx0, checkpoint, x, dt, A, B, C, ids_counts,
+                                     history.x, history.dt, history.b, window);
 
     size_t offset = ggml_nelements(x)*ggml_element_size(out);
     for (const auto & field : fields) {
         auto * cache = field.cache;
-        if (!cache) {
-            continue;
-        }
-        if (cache == checkpoint && inp->verify_ids) {
-            if (n_write) {
-                const size_t stride = ggml_row_size(out->type, cache->ne[0]);
-                auto * src = ggml_view_2d(ctx0, out, cache->ne[0], n_write, stride, offset);
-                ggml_format_name(src, "ssm_replay_checkpoint-%d", il);
-                ggml_build_forward_expand(gf, ggml_set_rows(ctx0, cache, src, inp->ckpt_dst));
-                offset += stride*n_write;
-            }
-            continue;
-        }
-        if (inp->verify_ids) {
-            if (!field.extra && !inp->feature_dst) {
-                continue;
-            }
-            const int64_t n_rs = mctx->get_n_rs();
-            auto * slots = ggml_view_2d(ctx0, cache, cache->ne[0], n_rs, cache->nb[1], head*cache->nb[1]);
-            if (field.extra) {
-                slots = ggml_cpy(ctx0, field.extra, slots);
-                ggml_build_forward_expand(gf, slots);
-            }
-            if (inp->feature_dst) {
-                const int64_t capacity = window + inp->n_pend;
-                const int64_t width = cache->ne[0]/capacity;
-                const size_t stride = ggml_row_size(out->type, width);
-                auto * rows = ggml_view_2d(ctx0, out, width, inp->feature_dst->ne[0], stride, offset);
-                auto * dst = ggml_reshape_2d(ctx0, slots, width, capacity*n_rs);
-                ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst, rows, inp->feature_dst));
-                offset += stride*inp->feature_dst->ne[0];
-            }
-            continue;
-        }
         const size_t stride = ggml_row_size(out->type, cache->ne[0]);
         auto * src = ggml_view_2d(ctx0, out, cache->ne[0], n_seqs, stride, offset);
         auto * dst = ggml_view_2d(ctx0, cache, cache->ne[0], n_seqs, cache->nb[1], head*cache->nb[1]);
@@ -248,9 +237,6 @@ static ggml_tensor * build_mamba2_replay(ggml_context * ctx0, ggml_cgraph * gf, 
     if (inp->s_copy_tail->ne[0] > 0) {
         for (const auto & field : fields) {
             auto * cache = field.cache;
-            if (!cache || (inp->verify_ids && cache != checkpoint)) {
-                continue;
-            }
             auto * src = ggml_view_2d(ctx0, field.extra, cache->ne[0], n_extra, field.extra->nb[1],
                                       (field.extra->ne[1] - n_extra)*field.extra->nb[1]);
             auto * dst = ggml_view_2d(ctx0, cache, cache->ne[0], n_extra, cache->nb[1], (head + n_seqs)*cache->nb[1]);
@@ -312,7 +298,7 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         // => {d_conv - 1 + n_seq_tokens, d_inner + 2*n_group*d_state, n_seqs}
         ggml_tensor * conv_x;
         const int64_t channels = d_inner + 2*n_group*d_state;
-        if (inp->verify_ids) {
+        if (inp->mamba_window) {
             conv_x = build_conv_state_replay(inp, conv_states_all, xBC, d_conv - 1, channels, il);
         } else {
             ggml_tensor * conv = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);

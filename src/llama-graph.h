@@ -328,8 +328,6 @@ public:
     int64_t       n_conv   = 0;       // conv window columns, the widest conv of the model
     int64_t       n_pend   = 0;       // pending slots per seq
     ggml_tensor * rep_n    = nullptr; // I32 [n_seqs], kept pending tokens
-    ggml_tensor * verify_ids = nullptr; // Mamba-2 source slots, accepted lengths and packed checkpoint rows
-    ggml_tensor * ckpt_dst   = nullptr; // destination slots of the checkpoints updated by this ubatch
     ggml_tensor * feature_dst = nullptr; // feature rows indexed relative to the first active slot
     int64_t       mamba_window = 0;
     bool          mamba_move = false;

@@ -1076,6 +1076,7 @@ struct llama_model {
     ggml_backend_dev_t dev_output() const;
 
     ggml_backend_buffer_type_t select_buft(int il) const;
+    ggml_backend_buffer_type_t select_mamba_replay_buft(ggml_backend_dev_t dev, int64_t n_seqs, uint32_t window, int64_t max_query) const;
 
     bool has_tensor_overrides() const;
 

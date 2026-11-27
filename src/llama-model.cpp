@@ -3045,6 +3045,20 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
             });
 }
 
+ggml_backend_buffer_type_t llama_model::select_mamba_replay_buft(ggml_backend_dev_t dev, int64_t n_seqs, uint32_t window, int64_t max_query) const {
+    const auto probe = [&](ggml_context * ctx) {
+        const int64_t capacity = window + max_query;
+        const auto rows = [&](int64_t width) { return ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, n_seqs); };
+        auto * s = rows(hparams.n_embd_s());
+        auto * A = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, hparams.ssm_dt_rank);
+        auto * h = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        return ggml_ssm_replay_checkpoint(ctx, s, A, h, rows(capacity*hparams.ssm_d_inner), rows(capacity*hparams.ssm_dt_rank),
+                                          rows(capacity*hparams.ssm_d_state*hparams.ssm_n_group), window, max_query);
+    };
+    auto * buft = ggml_backend_dev_buffer_type(dev);
+    return buft_supported(buft, dev, probe) ? buft : ggml_backend_cpu_buffer_type();
+}
+
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }

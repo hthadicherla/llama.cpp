@@ -177,7 +177,8 @@ __global__ void __launch_bounds__(d_state, 1)
     const int group_off = (head_idx / (n_head / n_group)) * d_state * sizeof(float);
 
     // TODO: refactor strides to be in elements/floats instead of bytes to be cleaner and consistent with the rest of the codebase
-    const float * s0_warp = (const float *) ((const char *) src0 + src6[seq_idx] * src0_nb3 + head_idx * src0_nb2 + head_off * d_state);
+    const int source = src6 ? src6[seq_idx] : seq_idx;
+    const float * s0_warp = (const float *) ((const char *) src0 + source * src0_nb3 + head_idx * src0_nb2 + head_off * d_state);
     const float * x_warp  = (const float *) ((const char *) src1 + (seq_idx * src1_nb3) + (warp_idx * sizeof(float)));
     const float * dt_warp = (const float *) ((const char *) src2 + (seq_idx * src2_nb2) + head_idx * sizeof(float));
     const float * A_warp  = (const float *) ((const char *) src3 + head_idx * src3_nb1);
@@ -597,7 +598,7 @@ __global__ void ssm_ssd_init_state_kernel(
     const int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx >= state_size) return;
 
-    const float * s_src = src0 + (int64_t)ids[s] * s0_stride_seq;
+    const float * s_src = src0 + (int64_t)(ids ? ids[s] : s) * s0_stride_seq;
     s_cur[s * state_size + idx] = s_src[idx];
 }
 
@@ -818,7 +819,7 @@ static void ggml_cuda_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int64_t s_off = ggml_nelements(src1) * sizeof(float);
 
     const int64_t n_scan = ggml_nelements(src1) + K*nc*nr*nh*n_s;
-    GGML_ASSERT(staged ? (staged_ids && K == 1 && n_scan <= ggml_nelements(dst)) : n_scan == ggml_nelements(dst));
+    GGML_ASSERT(staged ? (K == 1 && n_scan <= ggml_nelements(dst)) : n_scan == ggml_nelements(dst));
     GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(src1->nb[0] == sizeof(float));
     GGML_ASSERT(src2->nb[0] == sizeof(float));
@@ -1128,38 +1129,62 @@ static __global__ void ssm_replay_commit(
     }
 }
 
+template<int d_state>
+static __global__ void ssm_replay_checkpoint(float * s, const float * A, const int32_t * counts, ssm_replay_history hist,
+            int64_t capacity, int64_t heads, int64_t width, int64_t groups, int window, int nt) {
+    const int seq = blockIdx.y, head = blockIdx.x, h = counts[seq];
+    if (h < 0 || (h > window && h > capacity-window)) { __trap(); }
+    if (h == 0 || (nt <= capacity-window && h + (int64_t)nt <= window)) { return; }
+    const int lane = threadIdx.x%WARP_SIZE, group = head/(heads/groups);
+    for (int64_t col = head*width + threadIdx.x/WARP_SIZE; col < (head+1)*width; col += blockDim.x/WARP_SIZE) {
+        float * dst = s + (seq*heads*width+col)*d_state + lane;
+        float state[d_state/WARP_SIZE];
+#pragma unroll
+        for (int n = 0; n < d_state/WARP_SIZE; ++n) { state[n] = dst[n*WARP_SIZE]; }
+        for (int j = 0; j < h; ++j) {
+            const int64_t t = seq*capacity + j;
+            const float dt = hist.dt[t*heads+head], decay = expf(A[head]*dt), xdt = hist.x[t*heads*width+col]*dt;
+            const float * b = hist.B + (t*groups+group)*d_state + lane;
+#pragma unroll
+            for (int n = 0; n < d_state/WARP_SIZE; ++n) { state[n] = state[n]*decay + b[n*WARP_SIZE]*xdt; }
+        }
+#pragma unroll
+        for (int n = 0; n < d_state/WARP_SIZE; ++n) { dst[n*WARP_SIZE] = state[n]; }
+    }
+}
+
+void ggml_cuda_op_ssm_replay_checkpoint(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const auto * x = dst->src[3], * dt = dst->src[4], * B = dst->src[5];
+    const int64_t heads = dst->src[1]->ne[1], capacity = dt->ne[0]/heads, inner = x->ne[0]/capacity;
+    const int64_t state = dst->ne[0]/inner, groups = B->ne[0]/(capacity*state);
+    const ssm_replay_history hist = { (const float *)x->data, (const float *)dt->data, (const float *)B->data };
+    const auto kernel = state == 64 ? ssm_replay_checkpoint<64> : state == 96 ? ssm_replay_checkpoint<96> :
+                        state == 128 ? ssm_replay_checkpoint<128> : ssm_replay_checkpoint<256>;
+    kernel<<<dim3(heads,dst->ne[1]), 4*WARP_SIZE, 0, ctx.stream()>>>((float *)dst->data,
+            (const float *)dst->src[1]->data, (const int32_t *)dst->src[2]->data, hist, capacity, heads, inner/heads,
+            groups, ggml_get_op_params_i32(dst,0), ggml_get_op_params_i32(dst,1));
+}
+
 struct ssm_verify {
     ssm_replay_params p;
     ssm_replay_history live, hist;
     const float * s, * A, * C;
     const int32_t * ids;
-    float * y, * checkpoints, * next, * cb, * scales;
-    int64_t ns, nt, capacity, span, n_write, x_token, dt_token, b_token, c_token;
-
-    __device__ bool prefill() const { return nt > capacity - p.window; }
-
-    __device__ void sequence(int seq, int & slot, int & h, int & row) const {
-        slot = ids[seq];
-        h = ids[ns + seq];
-        row = ids[2*ns + seq];
-        if (slot < 0 || slot >= p.slots || h < 0 || (h > p.window && h > capacity - p.window) ||
-            row < ((prefill() || (h > 0 && h + nt > p.window)) ? 0 : -1) || row >= n_write) {
-            __trap();
-        }
-    }
+    float * y, * next, * cb, * scales;
+    int64_t ns, nt, capacity, span, x_token, dt_token, b_token, c_token;
 
     template<int field>
-    __device__ const float * feature(int seq, int slot, int h, int64_t j) const {
+    __device__ const float * feature(int seq, int h, int64_t j) const {
         if (j < h) {
             return ssm_replay_field(field, hist.x, hist.dt, hist.B) +
-                (slot*capacity + j)*(p.history_off[field + 1] - p.history_off[field]);
+                (seq*capacity + j)*(p.history_off[field + 1] - p.history_off[field]);
         }
         return ssm_replay_field(field, live.x, live.dt, live.B) +
             seq*ssm_replay_field(field, p.x_seq, p.dt_seq, p.B_seq) +
             (j-h)*ssm_replay_field(field, x_token, dt_token, b_token);
     }
-    __device__ float step(int seq, int slot, int h, int64_t j, int head) const {
-        const float d = feature<1>(seq, slot, h, j)[head];
+    __device__ float step(int seq, int h, int64_t j, int head) const {
+        const float d = feature<1>(seq, h, j)[head];
         return j < h || d > 20.0f ? d : log1pf(expf(d));
     }
 
@@ -1173,20 +1198,19 @@ static __global__ void ssm_verify_coefficients(ssm_verify v) {
     const int seq = blockIdx.z, head = blockIdx.y, t = blockIdx.x;
     const int lane = threadIdx.x % WARP_SIZE, warp = threadIdx.x / WARP_SIZE;
     const int group = head/(v.p.n_head/v.p.n_group);
-    int slot, h, row;
-    v.sequence(seq, slot, h, row);
+    const int h = v.ids[seq];
     const int first = h + v.nt > v.p.window ? h : 0;
     const int last = h + t;
     for (int m = threadIdx.x; m < v.p.head_dim; m += blockDim.x) {
         const int col = head*v.p.head_dim+m;
-        v.append<0>(seq,t)[col] = v.feature<0>(seq,slot,h,last)[col];
+        v.append<0>(seq,t)[col] = v.feature<0>(seq,h,last)[col];
     }
     if (warp == 0) {
         float * scales = v.scales + ((seq*v.nt+t)*v.p.n_head+head)*(v.span+1);
         float suffix = 0;
         for (int end = last; end >= first; end -= WARP_SIZE) {
             const int j = end - lane;
-            const float d = j >= first ? v.step(seq, slot, h, j, head) : 0.0f;
+            const float d = j >= first ? v.step(seq, h, j, head) : 0.0f;
             if (j == last) { v.append<1>(seq,t)[head] = d; }
             const float sum = warp_prefix_inclusive_sum(d);
             const float below = ggml_cuda_shfl_up(sum, 1, WARP_SIZE);
@@ -1200,12 +1224,12 @@ static __global__ void ssm_verify_coefficients(ssm_verify v) {
     if (head % (v.p.n_head/v.p.n_group) == 0) {
         for (int n = threadIdx.x; n < v.p.d_state; n += blockDim.x) {
             const int k = group*v.p.d_state+n;
-            v.append<2>(seq,t)[k] = v.feature<2>(seq,slot,h,last)[k];
+            v.append<2>(seq,t)[k] = v.feature<2>(seq,h,last)[k];
         }
         const float * c = v.C + seq*v.p.C_seq + t*v.c_token + group*v.p.d_state;
         float * cb = v.cb + ((seq*v.nt+t)*v.p.n_group+group)*v.span;
         for (int j = first+warp; j <= last; j += blockDim.x/WARP_SIZE) {
-            const float * b = v.feature<2>(seq, slot, h, j) + group*v.p.d_state;
+            const float * b = v.feature<2>(seq, h, j) + group*v.p.d_state;
             float dot = 0;
             for (int n = lane; n < v.p.d_state; n += WARP_SIZE) { dot += c[n]*b[n]; }
             dot = warp_reduce_sum(dot);
@@ -1221,33 +1245,13 @@ static __global__ void ssm_verify_scan(ssm_verify v) {
     const int64_t inner = v.p.head_dim*v.p.n_head;
     if (col >= inner) { return; }
     const int head = col/v.p.head_dim, group = head/(v.p.n_head/v.p.n_group);
-    int slot, h, row;
-    v.sequence(seq, slot, h, row);
-    const bool flush = v.prefill() || h + v.nt > v.p.window;
+    const int h = v.ids[seq];
     float state[d_state/WARP_SIZE];
 #pragma unroll
     for (int n = 0; n < d_state/WARP_SIZE; ++n) {
-        state[n] = v.s[(slot*inner+col)*d_state + n*WARP_SIZE+lane];
+        state[n] = v.s[(seq*inner+col)*d_state + n*WARP_SIZE+lane];
     }
-    for (int j = 0; flush && j < h; ++j) {
-        const float dt = v.step(seq, slot, h, j, head);
-        const float decay = expf(v.A[head]*dt);
-        const float xdt = v.feature<0>(seq, slot, h, j)[col]*dt;
-        const float * b = v.feature<2>(seq, slot, h, j) + group*d_state;
-#pragma unroll
-        for (int n = 0; n < d_state/WARP_SIZE; ++n) {
-            const int k = n*WARP_SIZE+lane;
-            state[n] = state[n]*decay + b[k]*xdt;
-        }
-    }
-    if (row >= 0) {
-#pragma unroll
-        for (int n = 0; n < d_state/WARP_SIZE; ++n) {
-            v.checkpoints[(row*inner+col)*d_state + n*WARP_SIZE+lane] = state[n];
-        }
-    }
-    if (v.prefill()) { return; }
-    const int first = flush ? h : 0;
+    const int first = h + v.nt > v.p.window ? h : 0;
     for (int64_t t = 0; t < v.nt; ++t) {
         const float * c = v.C + seq*v.p.C_seq + t*v.c_token + group*d_state;
         const float * scales = v.scales + ((seq*v.nt+t)*v.p.n_head+head)*(v.span+1);
@@ -1256,18 +1260,11 @@ static __global__ void ssm_verify_scan(ssm_verify v) {
 #pragma unroll
         for (int n = 0; n < d_state/WARP_SIZE; ++n) { anchor += state[n]*c[n*WARP_SIZE+lane]; }
         for (int j = first+lane; j <= h+t; j += WARP_SIZE) {
-            delta += v.feature<0>(seq, slot, h, j)[col]*(scales[j-first]*cb[j-first]);
+            delta += v.feature<0>(seq, h, j)[col]*(scales[j-first]*cb[j-first]);
         }
         anchor = warp_reduce_sum(anchor);
         delta = warp_reduce_sum(delta);
         if (lane == 0) { v.y[(seq*v.nt+t)*inner+col] = fmaf(anchor, scales[v.span], delta); }
-    }
-}
-
-static __global__ void ssm_verify_prefill_checkpoints(const float * states, float * dst, const int32_t * rows, int64_t size) {
-    const int seq = blockIdx.y;
-    for (int64_t i = blockIdx.x*blockDim.x + threadIdx.x; i < size; i += gridDim.x*blockDim.x) {
-        dst[rows[seq]*size + i] = states[seq*size + i];
     }
 }
 
@@ -1295,42 +1292,28 @@ static void ggml_cuda_op_ssm_scan_replay(ggml_backend_cuda_context & ctx, ggml_t
         { 0, inner, inner + x->ne[1], inner + x->ne[1] + B->ne[0] * B->ne[1] },
     };
     cudaStream_t stream = ctx.stream();
-    if (ids->ne[1] == 3) {
+    if (ids->ne[1] == 1) {
         GGML_ASSERT(!cache);
-        const int64_t n_write = ggml_get_op_params_i32(dst, 2);
         const int64_t capacity = dst->src[7]->ne[0]/inner, span = std::max(p.window, n_tok);
-        const bool prefill = n_tok > capacity - p.window;
-        ggml_cuda_pool_alloc<float> coeff(ctx.pool());
-        float * cb = nullptr, * scales = nullptr;
-        if (!prefill) {
-            const size_t n_cb = n_seq*n_tok*p.n_group*span;
-            cb = coeff.alloc(n_cb + n_seq*n_tok*p.n_head*(span+1));
-            scales = cb + n_cb;
+        if (n_tok > capacity - p.window) {
+            ggml_cuda_ssm_scan(ctx, dst, nullptr, (const float *)s->data, nullptr);
+            return;
         }
+        const size_t n_cb = n_seq*n_tok*p.n_group*span;
+        ggml_cuda_pool_alloc<float> coeff(ctx.pool(), n_cb + n_seq*n_tok*p.n_head*(span+1));
         float * y = (float *)dst->data;
         const ssm_verify v = { p, { (const float *)x->data, (const float *)dt->data, (const float *)B->data },
             history, (const float *)s->data, (const float *)A->data, (const float *)C->data, (const int32_t *)ids->data,
-            y, y+n_y, y+n_y+D*n_write, cb, scales, n_seq, n_tok, capacity, span, n_write,
+            y, y+n_y, coeff.get(), coeff.get()+n_cb, n_seq, n_tok, capacity, span,
             (int64_t)(x->nb[2]/sizeof(float)), (int64_t)(dt->nb[1]/sizeof(float)),
             (int64_t)(B->nb[2]/sizeof(float)), (int64_t)(C->nb[2]/sizeof(float)) };
         constexpr int warps = 4;
-        if (!prefill) {
-            ssm_verify_coefficients<<<dim3(n_tok, p.n_head, n_seq), warps*WARP_SIZE, 0, stream>>>(v);
-            CUDA_CHECK(cudaGetLastError());
-        }
+        ssm_verify_coefficients<<<dim3(n_tok, p.n_head, n_seq), warps*WARP_SIZE, 0, stream>>>(v);
+        CUDA_CHECK(cudaGetLastError());
         const auto kernel = p.d_state == 64 ? ssm_verify_scan<64> : p.d_state == 96 ? ssm_verify_scan<96> :
                             p.d_state == 128 ? ssm_verify_scan<128> : ssm_verify_scan<256>;
         kernel<<<dim3((inner+warps-1)/warps, n_seq), warps*WARP_SIZE, 0, stream>>>(v);
         CUDA_CHECK(cudaGetLastError());
-        if (prefill) {
-            // Read the folded checkpoints in compact row order. The ordinary scan emits states in batch order.
-            ggml_cuda_pool_alloc<float> prefill_states(ctx.pool(), D*n_seq);
-            const ggml_cuda_ssm_scan_fused_cache final = { prefill_states.get(), 0 };
-            ggml_cuda_ssm_scan(ctx, dst, &final, v.checkpoints, v.ids + 2*n_seq);
-            ssm_verify_prefill_checkpoints<<<dim3(std::min<int64_t>(128,(D+255)/256), n_seq), 256, 0, stream>>>(
-                prefill_states.get(), v.checkpoints, v.ids + 2*n_seq, D);
-            CUDA_CHECK(cudaGetLastError());
-        }
         return;
     }
     float * out = cache ? cache->data : (float *) dst->data + n_y;

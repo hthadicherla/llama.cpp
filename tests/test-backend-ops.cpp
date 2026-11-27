@@ -5795,10 +5795,10 @@ struct test_ssm_scan_replay : public test_case {
             B = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d_state, n_group, n_seq_tokens, n_seqs);
             C = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d_state, n_group, n_seq_tokens, n_seqs);
         }
-        ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_seqs, extra_rows ? 3 : 2);
+        ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_seqs, extra_rows ? 1 : 2);
         ggml_set_name(dt_cache, "replay_dt_cache");
         ggml_set_name(A, "replay_A");
-        ggml_set_name(ids, "replay_ids");
+        ggml_set_name(ids, extra_rows ? "replay_counts" : "replay_ids");
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -5902,31 +5902,22 @@ struct test_ssm_scan_replay_coefficient : public test_ssm_scan_replay_error {
 
 struct test_ssm_scan_replay_verify : public test_ssm_scan_replay_error {
     const int32_t max_query;
-    const bool copy_slot;
     int32_t counts[2];
-    int32_t writes[2];
-    int32_t n_write = 0;
     ggml_tensor * expected;
 
-    test_ssm_scan_replay_verify(int32_t tokens, int32_t max_query, int32_t count, bool copy_slot = false, int32_t window = 16)
+    test_ssm_scan_replay_verify(int32_t tokens, int32_t max_query, int32_t count, int32_t other, int32_t window = 16)
         : test_ssm_scan_replay_error(window, 64, 32, 4, 2, tokens, 2, count), max_query(max_query),
-          copy_slot(copy_slot), counts{count, std::min(count + 1, window)} {
-        for (int seq = 0; seq < 2; ++seq) {
-            const bool flush = counts[seq] > 0 && counts[seq] + tokens > window;
-            const bool emit = tokens > max_query || flush || (copy_slot && seq == 1);
-            writes[seq] = emit ? n_write++ : -1;
-        }
-    }
+          counts{count, other} {}
 
     std::string op_desc(ggml_tensor *) override { return "SSM_SCAN_REPLAY_VERIFY"; }
-    std::string vars() override { return test_ssm_scan_replay::vars() + "," + VARS_TO_STR2(max_query, copy_slot); }
+    std::string vars() override { return test_ssm_scan_replay::vars() + "," + VAR_TO_STR(max_query) + ",other=" + std::to_string(counts[1]); }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         build_inputs(ctx, max_query);
-        ggml_tensor * out = ggml_ssm_scan_replay_verify(ctx, s, x, dt, A, B, C, ids, x_cache, dt_cache, B_cache, window, n_write);
-        const int64_t features = n_seq_tokens <= max_query ? ggml_nelements(x) + ggml_nelements(dt) + ggml_nelements(B) : 0;
-        const int64_t size = ggml_nelements(x) + n_write*s->ne[0] + features;
-        expected = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, size);
+        auto * checkpoint = ggml_ssm_replay_checkpoint(ctx, s, A, ids, x_cache, dt_cache, B_cache, window, n_seq_tokens);
+        auto * out = ggml_ssm_scan_replay_verify(ctx, checkpoint, x, dt, A, B, C, ids, x_cache, dt_cache, B_cache, window);
+        out = ggml_concat(ctx, out, ggml_reshape_1d(ctx, checkpoint, ggml_nelements(s)), 0);
+        expected = ggml_dup_tensor(ctx, out);
         return ggml_sub(ctx, out, expected);
     }
 
@@ -5938,8 +5929,7 @@ struct test_ssm_scan_replay_verify : public test_ssm_scan_replay_error {
         init_tensor_uniform(dt_cache, 1, 1);
         init_tensor_uniform(B_cache, 1, 1);
         init_tensor_uniform(x_cache, 1, 1);
-        const int32_t metadata[] = { 0, copy_slot ? 0 : 1, counts[0], counts[1], writes[0], writes[1] };
-        ggml_backend_tensor_set(ids, metadata, 0, sizeof(metadata));
+        ggml_backend_tensor_set(ids, counts, 0, sizeof(counts));
         std::vector<float> checkpoints(ggml_nelements(s), 2.0f);
         std::fill_n(checkpoints.begin(), s->ne[0], 3.0f);
         ggml_backend_tensor_set(s, checkpoints.data(), 0, ggml_nbytes(s));
@@ -5949,7 +5939,7 @@ struct test_ssm_scan_replay_verify : public test_ssm_scan_replay_error {
         std::vector<float> xs(ggml_nelements(x)), bs(ggml_nelements(B)), cs(ggml_nelements(C));
         std::vector<float> result(ggml_nelements(expected));
         for (int seq = 0; seq < 2; ++seq) {
-            const float initial = checkpoints[metadata[seq]*s->ne[0]];
+            const float initial = checkpoints[seq*s->ne[0]];
             float prior = initial;
             for (int j = 0; j < counts[seq]; ++j) {
                 prior = std::exp(-1.0f)*prior + 1.0f;
@@ -5968,10 +5958,12 @@ struct test_ssm_scan_replay_verify : public test_ssm_scan_replay_error {
                     state = 0.5f*state + delta*bv*xv;
                     std::fill_n(result.begin() + group*cols, cols, state*weight);
                 }
-                if (writes[seq] >= 0) {
-                    const float checkpoint = n_seq_tokens > max_query ? state : counts[seq] + n_seq_tokens > window ? prior : initial;
-                    auto dst = result.begin() + ggml_nelements(x) + writes[seq]*s->ne[0] + g*cols*d_state;
-                    std::fill_n(dst, cols*d_state, checkpoint);
+                const auto pos = seq*s->ne[0] + g*cols*d_state;
+                const bool prefill = n_seq_tokens > max_query;
+                const float checkpoint = prefill || counts[seq] + n_seq_tokens > window ? prior : initial;
+                std::fill_n(result.end() - ggml_nelements(s) + pos, cols*d_state, checkpoint);
+                if (prefill) {
+                    std::fill_n(result.begin() + ggml_nelements(x) + pos, cols*d_state, state);
                 }
             }
         }
@@ -5979,7 +5971,7 @@ struct test_ssm_scan_replay_verify : public test_ssm_scan_replay_error {
         ggml_backend_tensor_set(B, bs.data(), 0, ggml_nbytes(B));
         ggml_backend_tensor_set(C, cs.data(), 0, ggml_nbytes(C));
         if (n_seq_tokens <= max_query) {
-            auto dst = result.begin() + ggml_nelements(x) + n_write*s->ne[0];
+            auto dst = result.begin() + ggml_nelements(x);
             dst = std::copy(xs.begin(), xs.end(), dst);
             dst = std::fill_n(dst, ggml_nelements(dt), delta);
             std::copy(bs.begin(), bs.end(), dst);
@@ -13653,13 +13645,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 16, 16, 8, 1, 4, -1, true, true));
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 1));
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 15));
-    test_cases.emplace_back(new test_ssm_scan_replay_verify(4, 4, 2));
-    test_cases.emplace_back(new test_ssm_scan_replay_verify(4, 4, 2, true)); // copy the checkpoint to a second slot
-    test_cases.emplace_back(new test_ssm_scan_replay_verify(4, 4, 12)); // exact boundary and overflow in one batch
-    test_cases.emplace_back(new test_ssm_scan_replay_verify(1, 4, 15));
-    test_cases.emplace_back(new test_ssm_scan_replay_verify(16, 16, 0));
-    test_cases.emplace_back(new test_ssm_scan_replay_verify(4, 8, 0, false, 2)); // empty prefix with T > L
-    test_cases.emplace_back(new test_ssm_scan_replay_verify(5, 4, 13)); // prefill drains history and current tokens
+    test_cases.emplace_back(new test_ssm_scan_replay_verify(4,  4,  2, 12));
+    test_cases.emplace_back(new test_ssm_scan_replay_verify(4,  4, 12, 13)); // exact fit and overflow
+    test_cases.emplace_back(new test_ssm_scan_replay_verify(4,  4, 13, 12));
+    test_cases.emplace_back(new test_ssm_scan_replay_verify(1,  4, 15, 16));
+    test_cases.emplace_back(new test_ssm_scan_replay_verify(16, 16, 0,  1));
+    test_cases.emplace_back(new test_ssm_scan_replay_verify(4,  8,  0,  1, 2)); // T > L
+    test_cases.emplace_back(new test_ssm_scan_replay_verify(5,  4,  1, 13)); // prefill drains either prefix
     // The copy fusion must preserve external readers, shared rows and overlapping inputs.
     test_cases.emplace_back(new test_ssm_scan_replay_cache(128, 7));
     test_cases.emplace_back(new test_ssm_scan_replay_cache(128, 7, true));

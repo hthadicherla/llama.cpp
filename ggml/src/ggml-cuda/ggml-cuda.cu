@@ -2764,6 +2764,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SSM_SCAN:
             ggml_cuda_op_ssm_scan(ctx, dst);
             break;
+        case GGML_OP_SSM_REPLAY_CHECKPOINT:
+            ggml_cuda_op_ssm_replay_checkpoint(ctx, dst);
+            break;
         case GGML_OP_TOP_K:
             ggml_cuda_op_top_k(ctx, dst);
             break;
@@ -4416,6 +4419,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                    (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
                    (op->type         == GGML_TYPE_F32 || op->type         == GGML_TYPE_F16);
+        case GGML_OP_SSM_REPLAY_CHECKPOINT: {
+            const int64_t capacity = op->src[4]->ne[0]/op->src[1]->ne[1];
+            const int64_t state = op->ne[0]/(op->src[3]->ne[0]/capacity);
+            return state == 64 || state == 96 || state == 128 || state == 256;
+        }
         case GGML_OP_SSM_SCAN: {
             const int32_t K = ggml_get_op_params_i32(op, 0);
             const int32_t window = ggml_get_op_params_i32(op, 1);
@@ -4429,7 +4437,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         return false;
                     }
                 }
-                if ((op->src[6]->ne[1] != 2 && op->src[6]->ne[1] != 3) || !ggml_is_contiguous(op->src[6])) {
+                if ((op->src[6]->ne[1] != 2 && op->src[6]->ne[1] != 1) || !ggml_is_contiguous(op->src[6])) {
                     return false;
                 }
                 for (int i = 7; i <= 9; ++i) {
