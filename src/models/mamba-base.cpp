@@ -176,8 +176,7 @@ static ggml_tensor * build_mamba2_replay(ggml_context * ctx0, ggml_cgraph * gf, 
         auto * state = active(checkpoint);
         ggml_tensor * features[] = {active(history.x), active(history.dt), active(history.b)};
         state = ggml_ssm_replay_checkpoint(ctx0, state, A, inp->rep_n, features[0], features[1], features[2], window, x->ne[2]);
-        auto * out = ggml_ssm_scan_replay_verify(ctx0, state, x, dt, A, B, C, inp->rep_n,
-                                                 features[0], features[1], features[2], window);
+        auto * out = ggml_ssm_scan_replay_verify(ctx0, state, x, dt, B, C);
         size_t offset = ggml_nelements(x)*ggml_element_size(out);
         if (inp->feature_dst) {
             const int64_t capacity = window + inp->n_pend;

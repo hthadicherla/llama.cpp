@@ -24081,3 +24081,5 @@
 "CPU","LIGHTNING_INDEXER","hsk=128,nh=64,kv=65,nb=32,ns=4,nm=1,type_K=q4_0","support","1","yes","CPU"
 "CPU","SSM_SCAN","window=16,d_state=128,head_dim=80,n_head=8,n_group=2,n_seq_tokens=300,n_seqs=2,count=7,xbc_overlap=0,shared_ids=0","support","1","yes","CPU"
 "CPU","SSM_SCAN","window=16,d_state=128,head_dim=16,n_head=16,n_group=8,n_seq_tokens=1,n_seqs=4,count=-1,xbc_overlap=1,shared_ids=1","support","1","yes","CPU"
+"CPU","SSM_REPLAY_CHECKPOINT","window=1,d_state=32,head_dim=16,n_head=4,n_group=2,n_seq_tokens=4,n_seqs=2,count=-1,xbc_overlap=0,shared_ids=0","support","1","yes","CPU"
+"CPU","SSM_REPLAY_CHECKPOINT","window=1,d_state=128,head_dim=16,n_head=4,n_group=2,n_seq_tokens=4,n_seqs=2,count=-1,xbc_overlap=0,shared_ids=0","support","1","yes","CPU"

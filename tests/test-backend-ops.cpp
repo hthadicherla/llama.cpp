@@ -5900,6 +5900,15 @@ struct test_ssm_scan_replay_coefficient : public test_ssm_scan_replay_error {
     }
 };
 
+struct test_ssm_replay_checkpoint : public test_ssm_scan_replay {
+    using test_ssm_scan_replay::test_ssm_scan_replay;
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        build_inputs(ctx, n_seq_tokens);
+        return ggml_ssm_replay_checkpoint(ctx, s, A, ids, x_cache, dt_cache, B_cache, window, n_seq_tokens);
+    }
+};
+
 struct test_ssm_scan_replay_verify : public test_ssm_scan_replay_error {
     const int32_t max_query;
     int32_t counts[2];
@@ -5915,7 +5924,7 @@ struct test_ssm_scan_replay_verify : public test_ssm_scan_replay_error {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         build_inputs(ctx, max_query);
         auto * checkpoint = ggml_ssm_replay_checkpoint(ctx, s, A, ids, x_cache, dt_cache, B_cache, window, n_seq_tokens);
-        auto * out = ggml_ssm_scan_replay_verify(ctx, checkpoint, x, dt, A, B, C, ids, x_cache, dt_cache, B_cache, window);
+        auto * out = ggml_ssm_scan_replay_verify(ctx, checkpoint, x, dt, B, C);
         out = ggml_concat(ctx, out, ggml_reshape_1d(ctx, checkpoint, ggml_nelements(s)), 0);
         expected = ggml_dup_tensor(ctx, out);
         return ggml_sub(ctx, out, expected);
@@ -13645,6 +13654,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan_replay(16, 128, 16, 16, 8, 1, 4, -1, true, true));
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 1));
     test_cases.emplace_back(new test_ssm_scan_replay_coefficient(16, 15));
+    for (int d_state : { 32, 128 }) {
+        test_cases.emplace_back(new test_ssm_replay_checkpoint(1, d_state, 16, 4, 2, 4, 2, -1));
+    }
     test_cases.emplace_back(new test_ssm_scan_replay_verify(4,  4,  2, 12));
     test_cases.emplace_back(new test_ssm_scan_replay_verify(4,  4, 12, 13)); // exact fit and overflow
     test_cases.emplace_back(new test_ssm_scan_replay_verify(4,  4, 13, 12));
