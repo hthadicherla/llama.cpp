@@ -5936,10 +5936,7 @@ struct test_ssm_scan_replay_verify : public test_ssm_scan_replay_error {
         init_tensor_uniform(A, -1.0f, -1.0f);
         init_tensor_uniform(dt, 0, 0);
         init_tensor_uniform(dt_cache, 1, 1);
-        init_tensor_uniform(B, 2, 2);
         init_tensor_uniform(B_cache, 1, 1);
-        init_tensor_uniform(C, 1.0f/d_state, 1.0f/d_state);
-        init_tensor_uniform(x, -1, -1);
         init_tensor_uniform(x_cache, 1, 1);
         const int32_t metadata[] = { 0, copy_slot ? 0 : 1, counts[0], counts[1], writes[0], writes[1] };
         ggml_backend_tensor_set(ids, metadata, 0, sizeof(metadata));
@@ -5947,30 +5944,45 @@ struct test_ssm_scan_replay_verify : public test_ssm_scan_replay_error {
         std::fill_n(checkpoints.begin(), s->ne[0], 3.0f);
         ggml_backend_tensor_set(s, checkpoints.data(), 0, ggml_nbytes(s));
 
-        // All state coordinates have the same scalar recurrence; C averages them for each y.
-        const int64_t inner = head_dim*n_head;
+        // Within a group the coordinates share one scalar recurrence. Distinguish tokens, groups and sequences.
+        const int64_t cols = head_dim*n_head/n_group;
+        std::vector<float> xs(ggml_nelements(x)), bs(ggml_nelements(B)), cs(ggml_nelements(C));
         std::vector<float> result(ggml_nelements(expected));
         for (int seq = 0; seq < 2; ++seq) {
             const float initial = checkpoints[metadata[seq]*s->ne[0]];
-            float state = initial;
+            float prior = initial;
             for (int j = 0; j < counts[seq]; ++j) {
-                state = std::exp(-1.0f)*state + 1.0f;
+                prior = std::exp(-1.0f)*prior + 1.0f;
             }
-            const float prior = state;
-            for (int j = 0; j < n_seq_tokens; ++j) {
-                state = 0.5f*state - 2.0f*delta;
-                std::fill_n(result.begin() + (seq*n_seq_tokens + j)*inner, inner, state);
-            }
-            if (writes[seq] >= 0) {
-                const float checkpoint = n_seq_tokens > max_query ? state : counts[seq] + n_seq_tokens > window ? prior : initial;
-                std::fill_n(result.begin() + ggml_nelements(x) + writes[seq]*s->ne[0], s->ne[0], checkpoint);
+            for (int64_t g = 0; g < n_group; ++g) {
+                float state = prior;
+                const float weight = g == 0 ? 0.5f : -1.0f;
+                for (int j = 0; j < n_seq_tokens; ++j) {
+                    const int64_t row = seq*n_seq_tokens + j;
+                    const int64_t group = row*n_group + g;
+                    const float xv = -0.75f + (row + g)/64.0f;
+                    const float bv = (1 + g)*(0.5f + 0.0625f*(row % 3));
+                    std::fill_n(xs.begin() + group*cols, cols, xv);
+                    std::fill_n(bs.begin() + group*d_state, d_state, bv);
+                    std::fill_n(cs.begin() + group*d_state, d_state, weight/d_state);
+                    state = 0.5f*state + delta*bv*xv;
+                    std::fill_n(result.begin() + group*cols, cols, state*weight);
+                }
+                if (writes[seq] >= 0) {
+                    const float checkpoint = n_seq_tokens > max_query ? state : counts[seq] + n_seq_tokens > window ? prior : initial;
+                    auto dst = result.begin() + ggml_nelements(x) + writes[seq]*s->ne[0] + g*cols*d_state;
+                    std::fill_n(dst, cols*d_state, checkpoint);
+                }
             }
         }
+        ggml_backend_tensor_set(x, xs.data(), 0, ggml_nbytes(x));
+        ggml_backend_tensor_set(B, bs.data(), 0, ggml_nbytes(B));
+        ggml_backend_tensor_set(C, cs.data(), 0, ggml_nbytes(C));
         if (n_seq_tokens <= max_query) {
             auto dst = result.begin() + ggml_nelements(x) + n_write*s->ne[0];
-            dst = std::fill_n(dst, ggml_nelements(x), -1.0f);
+            dst = std::copy(xs.begin(), xs.end(), dst);
             dst = std::fill_n(dst, ggml_nelements(dt), delta);
-            std::fill_n(dst, ggml_nelements(B), 2.0f);
+            std::copy(bs.begin(), bs.end(), dst);
         }
         ggml_backend_tensor_set(expected, result.data(), 0, ggml_nbytes(expected));
     }
