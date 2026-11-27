@@ -20,7 +20,7 @@
 
 // State data layout: 0 is ordinary, 1 is transposed, 2 adds separate Mamba replay tensors.
 static constexpr uint32_t MAMBA_REPLAY_LAYOUT = 2;
-static constexpr uint32_t MAMBA_VERIFY_LAST_BLOCK_DEVICE = 3;
+static constexpr uint32_t MAMBA_VERIFY_LAST_BLOCK_FULL = 3;
 static constexpr uint32_t MAMBA_VERIFY_LAST_BLOCK = 4;
 static constexpr uint32_t MAMBA_VERIFY_FULL_ROWS = 5;
 static constexpr uint32_t MAMBA_VERIFY_LAYOUT = 6;
@@ -1316,11 +1316,8 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
     }
     const bool s_trans = layout == 1;
     const uint32_t expected = mamba_replay_window ? (rs_replay ? MAMBA_VERIFY_LAYOUT : MAMBA_REPLAY_LAYOUT) : 0;
-    const bool last_block = layout == MAMBA_VERIFY_LAST_BLOCK && expected == MAMBA_VERIFY_LAYOUT;
-    if (layout == MAMBA_VERIFY_LAST_BLOCK_DEVICE && expected == MAMBA_VERIFY_LAYOUT) {
-        LLAMA_LOG_ERROR("%s: the one-block device snapshot has incompatible ReplaySSM history buffers\n", __func__);
-        return false;
-    }
+    const bool last_full = layout == MAMBA_VERIFY_LAST_BLOCK_FULL;
+    const bool last_block = (last_full || layout == MAMBA_VERIFY_LAST_BLOCK) && expected == MAMBA_VERIFY_LAYOUT;
     if (layout != expected && !(layout == 0 && expected == MAMBA_REPLAY_LAYOUT) &&
         !(layout == MAMBA_VERIFY_FULL_ROWS && expected == MAMBA_VERIFY_LAYOUT) && !last_block) {
         LLAMA_LOG_ERROR("%s: incompatible recurrent cache layout %u\n", __func__, layout);
@@ -1350,7 +1347,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         if (layout == MAMBA_VERIFY_LAYOUT || last_block) {
             for (uint32_t row = head; row < head + cell_count; ++row) {
                 const uint32_t window = n_rs_seq + 1 + (features ? mamba_replay_window : 0);
-                const uint32_t pending = features ? cells[row].mamba_pend : cells[row].rs_pend;
+                const uint32_t pending = last_full ? n_rs_seq + 1 : (features ? cells[row].mamba_pend : cells[row].rs_pend);
                 const size_t bytes = mamba_verify_prefix_bytes(t, window, pending, n_conv);
                 if (bytes && raw_dt) {
                     // The one-block portable format stored biased dt before softplus.
