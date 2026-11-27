@@ -13657,6 +13657,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan_replay_cache(128, 7, true));
     test_cases.emplace_back(new test_ssm_scan_replay_cache(128, 7, false, 300));
     test_cases.emplace_back(new test_ssm_scan_replay_cache(64, 7, false, 300));
+    test_cases.emplace_back(new test_ssm_scan_replay_cache(64, 7, false, 4, 64, 4, 2, 2));
     test_cases.emplace_back(new test_ssm_scan_replay_cache(64, 15, false, 1, 64, 4, 2, 3));
     test_cases.emplace_back(new test_ssm_scan_replay_cache(128, -1, false, 1, 32, 8, 1, 4, true, true));
     test_cases.emplace_back(new test_ssm_scan_replay_cache(128, 7, false, 1, 64, 4, 2, 1, false, false, true));
