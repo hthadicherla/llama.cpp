@@ -1694,16 +1694,15 @@ uint32_t llama_memory_recurrent_context::get_mamba_rep(int i) const {
     return is_full ? 0 : mem->cells[i + mem->head].mamba_rep;
 }
 
-bool llama_memory_recurrent_context::mamba_move() const {
+uint32_t llama_memory_recurrent_context::get_n_mamba_moves() const {
     if (is_full) {
-        return mem->size > 1;
+        return mem->size > 1 ? mem->size : 0;
     }
+    uint32_t n = 0;
     for (uint32_t i = mem->head; i < mem->head + get_n_rs(); ++i) {
-        if (mem->cells[i].src0 != (int32_t) i) {
-            return true;
-        }
+        n += mem->cells[i].src0 != (int32_t) i;
     }
-    return false;
+    return n;
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {

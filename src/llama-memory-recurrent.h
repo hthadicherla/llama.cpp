@@ -223,7 +223,7 @@ public:
     bool     get_rs_replay() const;
     uint32_t get_rs_rep(int i) const; // pending tokens replayed by ubatch seq i
     uint32_t get_mamba_rep(int i) const;
-    bool     mamba_move() const;
+    uint32_t get_n_mamba_moves() const;
 
 private:
     const llama_memory_status status;

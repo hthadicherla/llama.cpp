@@ -167,9 +167,9 @@ static ggml_tensor * build_mamba2_replay(ggml_context * ctx0, ggml_cgraph * gf, 
         }
         const auto active = [&](ggml_tensor * cache) {
             auto * slots = ggml_view_2d(ctx0, cache, cache->ne[0], mctx->get_n_rs(), cache->nb[1], head*cache->nb[1]);
-            if (inp->mamba_move) {
-                // Snapshot the whole permutation before overwriting its active slots or inactive tail.
-                slots = ggml_cpy(ctx0, ggml_get_rows(ctx0, cache, inp->s_copy), slots);
+            if (inp->move_src) {
+                // Gather every relocated source before scattering, including moves into the inactive tail.
+                slots = ggml_set_rows(ctx0, slots, ggml_get_rows(ctx0, cache, inp->move_src), inp->move_dst);
             }
             return ggml_view_2d(ctx0, slots, slots->ne[0], n_seqs, slots->nb[1], 0);
         };
