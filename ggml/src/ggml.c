@@ -5851,7 +5851,7 @@ struct ggml_tensor * ggml_ssm_replay_checkpoint(
     const int64_t inner = x_cache->ne[0]/capacity;
     GGML_ASSERT(inner > 0 && inner%heads == 0 && x_cache->ne[0] == inner*capacity);
     const int64_t state = s->ne[0]/inner;
-    GGML_ASSERT(state > 0 && s->ne[0] == state*inner);
+    GGML_ASSERT(state > 0 && state <= INT_MAX && s->ne[0] == state*inner);
     const int64_t groups = B_cache->ne[0]/(capacity*state);
     GGML_ASSERT(groups > 0 && heads%groups == 0 && B_cache->ne[0] == capacity*state*groups);
 
@@ -5872,6 +5872,7 @@ struct ggml_tensor * ggml_ssm_scan_replay_verify(
         struct ggml_context * ctx, struct ggml_tensor * checkpoint, struct ggml_tensor * x,
         struct ggml_tensor * dt, struct ggml_tensor * B, struct ggml_tensor * C) {
     GGML_ASSERT(checkpoint->op == GGML_OP_SSM_REPLAY_CHECKPOINT && ggml_get_op_params_i32(checkpoint, 1) == x->ne[2]);
+    GGML_ASSERT(x->ne[0] <= INT_MAX);
     return ggml_ssm_scan_replay_impl(ctx, checkpoint, x, dt, checkpoint->src[1], B, C, checkpoint->src[2],
             checkpoint->src[3], checkpoint->src[4], checkpoint->src[5], ggml_get_op_params_i32(checkpoint, 0), true);
 }
