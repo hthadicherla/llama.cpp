@@ -10558,29 +10558,26 @@ static void ggml_compute_forward_ssm_scan_replay(
                 scales[j] = steps[j]*expf(A*suffix_dt);
                 suffix_dt += steps[j];
                 if (!flush) {
-                    bc[j] = 0.0f;
-                    for (int64_t n = 0; n < nc; ++n) {
-                        bc[j] += B_steps[j][n]*C[n];
-                    }
+                    ggml_vec_dot_f32(nc, &bc[j], 0, B_steps[j], 0, C, 0, 1);
                 }
             }
             const float total_decay = expf(A*suffix_dt);
             for (int64_t m = 0; m < nr; ++m) {
                 float sum = 0.0f;
-                for (int64_t n = 0; n < nc; ++n) {
-                    const int64_t i = (h*nr + m)*nc + n;
-                    if (flush && n_steps > 0) {
+                const int64_t i0 = (h*nr + m)*nc;
+                if (flush && n_steps > 0) {
+                    for (int64_t n = 0; n < nc; ++n) {
                         float delta = 0.0f;
                         for (int32_t j = 0; j < n_steps; ++j) {
                             delta += x_steps[j][h*nr + m]*(B_steps[j][n]*scales[j]);
                         }
-                        s[i] = s0[i]*total_decay + delta;
-                    } else {
-                        s[i] = s0[i];
+                        s[i0 + n] = s0[i0 + n]*total_decay + delta;
                     }
-                    if (nt == 1) {
-                        sum += s[i]*C[n];
-                    }
+                } else {
+                    memcpy(s + i0, s0 + i0, nc*sizeof(float));
+                }
+                if (nt == 1) {
+                    ggml_vec_dot_f32(nc, &sum, 0, s + i0, 0, C, 0, 1);
                 }
                 if (!flush) {
                     float delta = 0.0f;
