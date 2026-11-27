@@ -5782,7 +5782,7 @@ struct ggml_tensor * ggml_ssm_scan_replay(
     const int64_t d_state = B->ne[0];
     const int64_t n_group = B->ne[1];
     const int64_t n_head  = x->ne[1];
-    GGML_ASSERT(d_state > 0 && n_group > 0 && n_head > 0 && x->ne[0] > 0);
+    GGML_ASSERT(d_state > 0 && d_state <= INT_MAX && n_group > 0 && n_head > 0 && x->ne[0] > 0);
     GGML_ASSERT(x->ne[2] > 0 && x->ne[3] > 0 && s->ne[1] > 0);
     GGML_ASSERT(n_head % n_group == 0);
     const int64_t d_inner  = x->ne[0]*n_head;
